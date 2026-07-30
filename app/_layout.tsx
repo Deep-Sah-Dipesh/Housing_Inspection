@@ -1,8 +1,9 @@
 import React, { Component, ReactNode, useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator } from 'react-native';
+import { View, Text, ActivityIndicator, Alert } from 'react-native';
 import { Stack } from 'expo-router';
 import { SQLiteProvider } from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system';
+import * as Updates from 'expo-updates';
 import { Ionicons } from '@expo/vector-icons';
 import { initDatabase } from '../utils/database';
 
@@ -46,6 +47,28 @@ export default function RootLayout() {
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
+    async function checkUpdates() {
+      try {
+        if (!__DEV__) {
+          const update = await Updates.checkForUpdateAsync();
+          if (update.isAvailable) {
+            await Updates.fetchUpdateAsync();
+            Alert.alert(
+              "Update Available",
+              "A new version of the app has been downloaded. Restart now to apply?",
+              [
+                { text: "Later (Next Launch)", style: "cancel" },
+                { text: "Restart Now", onPress: () => Updates.reloadAsync() }
+              ]
+            );
+          }
+        }
+      } catch (e) {
+        console.log("OTA Update check failed:", e);
+      }
+    }
+    checkUpdates();
+
     // Artificial delay to ensure FileSystem is mounted before SQLite fires
     setTimeout(() => {
       setIsReady(true);

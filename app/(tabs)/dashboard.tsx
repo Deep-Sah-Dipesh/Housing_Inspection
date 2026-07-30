@@ -1,349 +1,471 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, FlatList, Modal, TextInput, Alert, ActivityIndicator, Platform } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, Platform } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as IntentLauncher from 'expo-intent-launcher';
-import * as Sharing from 'expo-sharing';
+import { exportMultipleBeneficiariesAsZip } from '../../utils/fileHelpers';
+
+interface BeneficiaryItem {
+  code: string;
+  name: string;
+  photo_count: number;
+  last_updated: string;
+}
 
 export default function DashboardScreen() {
-  const router = useRouter();
   const db = useSQLiteContext();
-  const [projects, setProjects] = useState<any[]>([]);
-  
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [isSelectionMode, setIsSelectionMode] = useState(false);
-  
-  const [showExportModal, setShowExportModal] = useState(false);
-  const [rows, setRows] = useState('2');
-  const [cols, setCols] = useState('2');
-  const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('portrait');
-
-  // Export Progress State
+  const router = useRouter();
+  const [groupedData, setGroupedData] = useState<{title: string, data: BeneficiaryItem[]}[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState(0);
-  const cancelExportRef = useRef(false);
+  const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
+
+  // PDF Export States
+  const [showPdfSettings, setShowPdfSettings] = useState(false);
+  const [pdfRows, setPdfRows] = useState('2');
+  const [pdfCols, setPdfCols] = useState('2');
+  const [isLandscape, setIsLandscape] = useState(false);
+  
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [pdfProgressMsg, setPdfProgressMsg] = useState('');
+  const cancelPdfRef = useRef(false);
 
   useFocusEffect(
-    useCallback(() => { loadData(); }, [])
+    useCallback(() => {
+      loadGroupedBeneficiaries();
+    }, [])
   );
 
-  const loadData = async () => {
+  const loadGroupedBeneficiaries = async () => {
+    setIsLoading(true);
     try {
-      const data = await db.getAllAsync(`
-        SELECT b.*, COUNT(p.id) as photoCount 
-        FROM beneficiaries b 
-        LEFT JOIN photos p ON b.code = p.beneficiary_code 
+      const results = await db.getAllAsync<BeneficiaryItem>(`
+        SELECT b.code, b.name, b.last_updated, COUNT(p.id) as photo_count
+        FROM beneficiaries b
+        LEFT JOIN photos p ON b.code = p.beneficiary_code
         GROUP BY b.code
         ORDER BY b.last_updated DESC
       `);
-      setProjects(data || []);
-    } catch (e) {}
-  };
 
-  const handleItemPress = (code: string) => {
-    if (isSelectionMode) toggleSelection(code);
-    else router.push(`/beneficiary/${encodeURIComponent(code)}`);
-  };
+      const groups = results.reduce((acc: any, current) => {
+        const dateObj = new Date(current.last_updated);
+        const dateStr = !isNaN(dateObj.getTime()) 
+          ? dateObj.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) 
+          : 'Unknown Date';
 
-  const handleLongPress = (code: string) => {
-    if (!isSelectionMode) {
-      setIsSelectionMode(true);
-      toggleSelection(code);
+        if (!acc[dateStr]) acc[dateStr] = [];
+        acc[dateStr].push(current);
+        return acc;
+      }, {});
+
+      const formattedSections = Object.keys(groups).map(date => ({
+        title: date,
+        data: groups[date]
+      }));
+
+      setGroupedData(formattedSections);
+    } catch (error) {
+      console.error("Failed to load dashboard data", error);
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const toggleSelection = (code: string) => {
-    const newSet = new Set(selectedIds);
-    newSet.has(code) ? newSet.delete(code) : newSet.add(code);
-    setSelectedIds(newSet);
-    if (newSet.size === 0) setIsSelectionMode(false);
+    if (selectedCodes.includes(code)) {
+      setSelectedCodes(prev => prev.filter(c => c !== code));
+    } else {
+      setSelectedCodes(prev => [...prev, code]);
+    }
   };
 
-  const cancelSelection = () => {
-    setSelectedIds(new Set());
-    setIsSelectionMode(false);
+  const handleSelectAll = () => {
+    if (selectedCodes.length > 0) {
+      setSelectedCodes([]);
+    } else {
+      const allCodes = groupedData.flatMap(section => section.data.map(item => item.code));
+      setSelectedCodes(allCodes);
+    }
   };
 
-  const handleExportPDF = async () => {
-    setShowExportModal(false);
-    setIsExporting(true);
-    setExportProgress(0);
-    cancelExportRef.current = false;
+  const handleBulkZipExport = () => {
+    if (selectedCodes.length === 0) return;
+    
+    Alert.alert(
+      "Export ZIP",
+      "How would you like to export these projects?",
+      [
+        { text: "Cancel", style: "cancel" },
+        { 
+          text: "Share via App", 
+          onPress: async () => {
+            setIsExporting(true);
+            await exportMultipleBeneficiariesAsZip(selectedCodes, 'share');
+            setIsExporting(false);
+            setSelectedCodes([]); 
+          }
+        },
+        { 
+          text: "Save to Device Folder", 
+          onPress: async () => {
+            setIsExporting(true);
+            await exportMultipleBeneficiariesAsZip(selectedCodes, 'save');
+            setIsExporting(false);
+            setSelectedCodes([]); 
+          }
+        }
+      ]
+    );
+  };
+
+  const handleGeneratePdf = async () => {
+    setShowPdfSettings(false);
+    setIsGeneratingPdf(true);
+    cancelPdfRef.current = false;
+    setPdfProgressMsg("Preparing selected projects...");
 
     try {
-      const placeholders = Array.from(selectedIds).map(() => '?').join(',');
+      const placeholders = selectedCodes.map(() => '?').join(',');
       const photos = await db.getAllAsync<any>(
-        `SELECT * FROM photos WHERE beneficiary_code IN (${placeholders}) ORDER BY beneficiary_code ASC, created_at ASC`,
-        Array.from(selectedIds)
+        `SELECT * FROM photos WHERE beneficiary_code IN (${placeholders}) ORDER BY created_at ASC`,
+        selectedCodes
       );
 
       if (photos.length === 0) {
-        setIsExporting(false);
-        return Alert.alert("No Photos", "The selected beneficiaries have no photos.");
+        Alert.alert("No Data", "None of the selected projects contain photos.");
+        setIsGeneratingPdf(false);
+        return;
       }
 
-      const r = parseInt(rows) || 2;
-      const c = parseInt(cols) || 2;
-      const photosPerPage = r * c;
-      const pages = [];
+      let processedPhotos = [];
+      for (let i = 0; i < photos.length; i++) {
+        if (cancelPdfRef.current) throw new Error("Cancelled by user");
+        
+        setPdfProgressMsg(`Compressing image ${i + 1} of ${photos.length}...`);
+        
+        // Rapid compression & Base64 conversion to prevent memory crashes
+        const manipResult = await ImageManipulator.manipulateAsync(
+          photos[i].local_uri,
+          [{ resize: { width: 800 } }],
+          { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+        );
 
-      for (let i = 0; i < photos.length; i += photosPerPage) {
-        pages.push(photos.slice(i, i + photosPerPage));
+        processedPhotos.push({
+          filename: photos[i].filename,
+          base64: manipResult.base64
+        });
       }
 
-      let html = `
+      setPdfProgressMsg("Formatting A4 PDF Document...");
+      
+      const rows = parseInt(pdfRows) || 2;
+      const cols = parseInt(pdfCols) || 2;
+      const itemsPerPage = rows * cols;
+      let pagesHtml = '';
+
+      // Strict Pagination to map images perfectly into A4 pages
+      for (let i = 0; i < processedPhotos.length; i += itemsPerPage) {
+        if (cancelPdfRef.current) throw new Error("Cancelled by user");
+        const chunk = processedPhotos.slice(i, i + itemsPerPage);
+        
+        pagesHtml += `<div class="page">`;
+        chunk.forEach(photo => {
+          const caption = photo.filename.replace(/\.[^/.]+$/, ""); // Removes .jpg extension
+          pagesHtml += `
+            <div class="img-cell">
+              <img src="data:image/jpeg;base64,${photo.base64}" />
+              <div class="caption">${caption}</div>
+            </div>
+          `;
+        });
+        pagesHtml += `</div>`;
+      }
+
+      const html = `
+        <!DOCTYPE html>
         <html>
         <head>
+          <meta charset="utf-8">
           <style>
-            @page { size: A4 ${orientation}; margin: 10mm; }
-            body { margin: 0; font-family: sans-serif; background: #FFF; }
+            @page { size: ${isLandscape ? 'A4 landscape' : 'A4 portrait'}; margin: 0; }
+            body { margin: 0; padding: 0; box-sizing: border-box; background: white; font-family: sans-serif; }
             .page { 
-              width: 100%; 
-              height: ${orientation === 'portrait' ? '277mm' : '190mm'}; 
-              page-break-after: always; 
-              display: grid; 
-              grid-template-columns: repeat(${c}, 1fr); 
-              grid-template-rows: repeat(${r}, 1fr); 
-              gap: 10mm; 
+              width: ${isLandscape ? '297mm' : '210mm'}; 
+              height: ${isLandscape ? '210mm' : '297mm'}; 
+              page-break-after: always;
+              padding: 10mm;
               box-sizing: border-box;
+              display: grid;
+              grid-template-columns: repeat(${cols}, 1fr);
+              grid-template-rows: repeat(${rows}, 1fr);
+              gap: 10mm;
             }
-            .img-container { 
-              display: flex; flex-direction: column; align-items: center; justify-content: center; 
-              border: 1px solid #CBD5E1; padding: 5px; height: 100%; box-sizing: border-box; border-radius: 8px;
+            .img-cell {
+              display: flex;
+              flex-direction: column;
+              align-items: center;
+              justify-content: center;
+              width: 100%;
+              height: 100%;
+              overflow: hidden;
             }
-            .img-container img { 
-              max-width: 100%; max-height: calc(100% - 35px); object-fit: contain; border-radius: 4px;
+            .img-cell img {
+              max-width: 100%;
+              max-height: 85%;
+              object-fit: contain;
+              border: 1px solid #CBD5E1;
+              border-radius: 4px;
             }
-            .label { 
-              margin-top: 8px; font-size: 11px; font-weight: bold; text-align: center; 
-              word-wrap: break-word; max-width: 100%; line-height: 1.3; color: #1E293B;
+            .caption {
+              margin-top: 8px;
+              font-size: 11px;
+              color: #1E293B;
+              text-align: center;
+              word-wrap: break-word;
+              max-width: 100%;
+              line-height: 1.4;
             }
           </style>
         </head>
         <body>
+          ${pagesHtml}
+        </body>
+        </html>
       `;
 
-      let totalProcessed = 0;
+      const { uri } = await Print.printToFileAsync({ html });
 
-      for (let pIdx = 0; pIdx < pages.length; pIdx++) {
-        if (cancelExportRef.current) throw new Error('CancelledByUser');
-        
-        const page = pages[pIdx];
-        html += `<div class="page">`;
-        
-        for (let img of page) {
-          if (cancelExportRef.current) throw new Error('CancelledByUser');
-
-          // CRITICAL FIX: Shrink the image so the PDF generator doesn't crash from memory overload
-          const compressedImg = await ImageManipulator.manipulateAsync(
-            img.local_uri,
-            [{ resize: { width: 800 } }], 
-            { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
-          );
-
-          const cleanName = img.filename.replace(/\.[^/.]+$/, "");
-          
-          html += `
-            <div class="img-container">
-              <img src="data:image/jpeg;base64,${compressedImg.base64}" />
-              <div class="label">${cleanName}</div>
-            </div>
-          `;
-          
-          totalProcessed++;
-          setExportProgress((totalProcessed / photos.length) * 100);
-        }
-        html += `</div>`;
-      }
-
-      html += `</body></html>`;
-
-      if (cancelExportRef.current) throw new Error('CancelledByUser');
-
-      const { uri } = await Print.printToFileAsync({ html, base64: false });
-      setIsExporting(false);
-      
-      // EXPLICIT INTENT LAUNCHER TO OPEN PDF DIRECTLY IN VIEWER
+      // Open natively in device PDF viewer
       if (Platform.OS === 'android') {
-         try {
-            const cUri = await FileSystem.getContentUriAsync(uri);
-            await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
-                data: cUri,
-                flags: 1, 
-                type: 'application/pdf'
-            });
-         } catch(e) {
-            await Sharing.shareAsync(uri, { UTI: 'com.adobe.pdf', mimeType: 'application/pdf' });
-         }
+        const contentUri = await FileSystem.getContentUriAsync(uri);
+        await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
+          data: contentUri,
+          flags: 1,
+          type: 'application/pdf'
+        });
       } else {
-         await Sharing.shareAsync(uri, { UTI: 'com.adobe.pdf', mimeType: 'application/pdf' });
+        await Sharing.shareAsync(uri, { UTI: 'com.adobe.pdf', mimeType: 'application/pdf' });
       }
 
-      cancelSelection();
-    } catch (e: any) {
-      setIsExporting(false);
-      if (e.message !== 'CancelledByUser') {
-        Alert.alert("Error", "Failed to generate PDF.");
+      setSelectedCodes([]); // Reset selection on success
+    } catch (error: any) {
+      if (error.message !== "Cancelled by user") {
+        Alert.alert("Export Failed", "Could not generate PDF document.");
       }
+    } finally {
+      setIsGeneratingPdf(false);
     }
   };
 
+  if (isLoading) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator size="large" color="#2563EB" />
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
-      <View style={[styles.header, isSelectionMode && { backgroundColor: '#EFF6FF' }]}>
-        {isSelectionMode ? (
-           <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'}}>
-             <Text style={[styles.title, {color: '#2563EB'}]}>{selectedIds.size} Selected</Text>
-             <TouchableOpacity onPress={cancelSelection}><Ionicons name="close-circle" size={28} color="#2563EB" /></TouchableOpacity>
-           </View>
-        ) : (
-           <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'}}>
-             <View>
-               <Text style={styles.title}>Dashboard</Text>
-               <Text style={styles.subtitle}>Select projects to export as PDF</Text>
-             </View>
-             <TouchableOpacity onPress={() => setIsSelectionMode(true)} style={styles.selectBtn}>
-                <Text style={styles.selectBtnText}>Select</Text>
-             </TouchableOpacity>
-           </View>
-        )}
+      <View style={styles.header}>
+        <Text style={styles.title}>Export Dashboard</Text>
+        <TouchableOpacity style={styles.selectAllBtn} onPress={handleSelectAll}>
+          <Text style={styles.selectAllText}>
+            {selectedCodes.length > 0 ? 'Deselect All' : 'Select All'}
+          </Text>
+        </TouchableOpacity>
       </View>
 
-      <FlatList
-        data={projects}
+      <SectionList
+        sections={groupedData}
         keyExtractor={(item) => item.code}
-        contentContainerStyle={{ padding: 15, paddingBottom: 100 }}
+        contentContainerStyle={{ paddingBottom: 120 }} 
+        renderSectionHeader={({ section: { title } }) => (
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionHeaderText}>{title}</Text>
+          </View>
+        )}
         renderItem={({ item }) => {
-          const isSelected = selectedIds.has(item.code);
+          const isSelected = selectedCodes.includes(item.code);
           return (
-            <TouchableOpacity 
-               style={[styles.card, isSelected && styles.cardSelected]} 
-               onPress={() => handleItemPress(item.code)}
-               onLongPress={() => handleLongPress(item.code)}
-               delayLongPress={300}
-            >
-              <View style={{flex: 1}}>
-                 <Text style={styles.cardCode}>{item.code}</Text>
-                 {item.name ? <Text style={styles.cardName}>{item.name}</Text> : null}
+            <View style={[styles.itemCard, isSelected && styles.itemCardSelected]}>
+              <TouchableOpacity 
+                style={[styles.checkbox, isSelected && styles.checkboxSelected]}
+                onPress={() => toggleSelection(item.code)}
+                hitSlop={{top: 15, bottom: 15, left: 10, right: 15}}
+              >
+                {isSelected && <Ionicons name="checkmark" size={16} color="#FFF" />}
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={{ flex: 1 }}
+                onPress={() => {
+                  if (selectedCodes.length > 0) toggleSelection(item.code);
+                  else router.push(`/beneficiary/${encodeURIComponent(item.code)}`);
+                }}
+                onLongPress={() => toggleSelection(item.code)}
+              >
+                <Text style={styles.itemTitle}>{item.name || 'Unnamed Project'}</Text>
+                <Text style={styles.itemCode}>ID: {item.code}</Text>
+              </TouchableOpacity>
+
+              <View style={styles.photoCountBadge}>
+                <Ionicons name="image" size={12} color="#64748B" style={{ marginRight: 4 }} />
+                <Text style={styles.photoCountText}>{item.photo_count}</Text>
               </View>
-              <View style={{alignItems: 'flex-end'}}>
-                 <Text style={[styles.photoCount, item.photoCount > 0 && {color: '#10B981'}]}>{item.photoCount} Photos</Text>
-                 {isSelectionMode && (
-                    <Ionicons name={isSelected ? "checkmark-circle" : "ellipse-outline"} size={24} color={isSelected ? "#2563EB" : "#CBD5E1"} style={{marginTop: 5}} />
-                 )}
-              </View>
-            </TouchableOpacity>
-          )
+            </View>
+          );
         }}
         ListEmptyComponent={
-          <Text style={{textAlign: 'center', marginTop: 40, color: '#94A3B8'}}>No projects found.</Text>
+          <View style={styles.emptyState}>
+            <Ionicons name="folder-open-outline" size={50} color="#CBD5E1" />
+            <Text style={styles.emptyStateText}>No projects found to export.</Text>
+          </View>
         }
       />
-      
-      {isSelectionMode && selectedIds.size > 0 && (
-        <TouchableOpacity style={styles.exportFab} onPress={() => setShowExportModal(true)}>
-          <Ionicons name="document-text" size={24} color="#FFF" style={{marginRight: 10}}/>
-          <Text style={{ color: '#FFF', fontWeight: 'bold', fontSize: 16 }}>Export {selectedIds.size} Project(s)</Text>
-        </TouchableOpacity>
+
+      {/* Slide-Up Action Toolbar */}
+      {selectedCodes.length > 0 && (
+        <View style={styles.bottomToolbar}>
+          <Text style={styles.selectedCountText}>{selectedCodes.length} Selected</Text>
+          
+          <View style={styles.toolbarActions}>
+            <TouchableOpacity style={styles.cancelBtn} onPress={() => setSelectedCodes([])} disabled={isExporting}>
+              <Text style={styles.cancelBtnText}>Clear</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#2563EB'}]} onPress={() => setShowPdfSettings(true)} disabled={isExporting}>
+              <Ionicons name="document-text" size={18} color="#FFF" style={{ marginRight: 6 }} />
+              <Text style={styles.exportBtnText}>PDF</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={styles.exportBtn} onPress={handleBulkZipExport} disabled={isExporting}>
+              {isExporting ? (
+                <ActivityIndicator size="small" color="#FFF" />
+              ) : (
+                <>
+                  <Ionicons name="archive" size={18} color="#FFF" style={{ marginRight: 6 }} />
+                  <Text style={styles.exportBtnText}>ZIP</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
       )}
 
-      {/* Grid Settings Modal */}
-      <Modal visible={showExportModal} transparent animationType="slide">
+      {/* PDF Generation Progress Modal */}
+      <Modal visible={isGeneratingPdf} transparent animationType="fade">
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20}}>
-               <Text style={styles.modalTitle}>A4 PDF Grid Layout</Text>
-               <TouchableOpacity onPress={() => setShowExportModal(false)}><Ionicons name="close" size={24} color="#64748B"/></TouchableOpacity>
-            </View>
-            
-            <View style={{flexDirection: 'row', gap: 15, marginBottom: 20}}>
-               <View style={{flex: 1}}>
-                  <Text style={styles.label}>Rows</Text>
-                  <TextInput style={styles.input} placeholder="2" keyboardType="number-pad" value={rows} onChangeText={setRows} />
-               </View>
-               <View style={{flex: 1}}>
-                  <Text style={styles.label}>Columns</Text>
-                  <TextInput style={styles.input} placeholder="2" keyboardType="number-pad" value={cols} onChangeText={setCols} />
-               </View>
-            </View>
-
-            <Text style={styles.label}>Page Orientation</Text>
-            <View style={{flexDirection: 'row', gap: 15, marginBottom: 25}}>
-              <TouchableOpacity style={[styles.orientationBtn, orientation === 'portrait' && styles.orientationBtnActive]} onPress={() => setOrientation('portrait')}>
-                <Text style={[styles.orientationBtnText, orientation === 'portrait' && styles.orientationBtnTextActive]}>Portrait</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.orientationBtn, orientation === 'landscape' && styles.orientationBtnActive]} onPress={() => setOrientation('landscape')}>
-                <Text style={[styles.orientationBtnText, orientation === 'landscape' && styles.orientationBtnTextActive]}>Landscape</Text>
-              </TouchableOpacity>
-            </View>
-            
-            <TouchableOpacity style={styles.primaryBtn} onPress={handleExportPDF}>
-              <Text style={{ color: '#FFF', fontWeight: 'bold', fontSize: 16, textAlign: 'center' }}>Generate PDF</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
-      {/* Progress Overlay */}
-      <Modal visible={isExporting} transparent animationType="fade">
-        <View style={styles.progressOverlay}>
           <View style={styles.progressCard}>
-            <ActivityIndicator size="large" color="#2563EB" style={{marginBottom: 15}} />
-            <Text style={styles.progressTitle}>Generating PDF...</Text>
-            <Text style={styles.progressSubtitle}>Optimizing & Compiling Images</Text>
-            
-            <View style={styles.progressBarBg}>
-              <View style={[styles.progressBarFill, { width: `${exportProgress}%` }]} />
-            </View>
-            <Text style={styles.progressPercent}>{Math.round(exportProgress)}%</Text>
-
-            <TouchableOpacity style={styles.cancelBtn} onPress={() => { cancelExportRef.current = true; setIsExporting(false); }}>
-              <Text style={styles.cancelBtnText}>Cancel Export</Text>
+            <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 15 }} />
+            <Text style={styles.progressText}>{pdfProgressMsg}</Text>
+            <TouchableOpacity style={styles.stopBtn} onPress={() => cancelPdfRef.current = true}>
+              <Text style={styles.stopBtnText}>Cancel</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
+      {/* PDF Settings Modal */}
+      <Modal visible={showPdfSettings} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>PDF Export Settings</Text>
+            
+            <View style={styles.settingRow}>
+               <Text style={styles.settingLabel}>Images Per Page (Grid)</Text>
+               <View style={{flexDirection: 'row', alignItems: 'center', gap: 10}}>
+                  <TextInput style={styles.numInput} value={pdfRows} onChangeText={setPdfRows} keyboardType="numeric" maxLength={1} selectTextOnFocus />
+                  <Text style={{fontWeight: 'bold', color: '#64748B'}}>Rows x</Text>
+                  <TextInput style={styles.numInput} value={pdfCols} onChangeText={setPdfCols} keyboardType="numeric" maxLength={1} selectTextOnFocus />
+                  <Text style={{fontWeight: 'bold', color: '#64748B'}}>Cols</Text>
+               </View>
+            </View>
+
+            <View style={styles.settingRow}>
+               <Text style={styles.settingLabel}>Page Orientation</Text>
+               <View style={{flexDirection: 'row', gap: 10}}>
+                 <TouchableOpacity style={[styles.orientBtn, !isLandscape && styles.orientBtnActive]} onPress={()=>setIsLandscape(false)}>
+                    <Text style={[styles.orientText, !isLandscape && styles.orientTextActive]}>Portrait</Text>
+                 </TouchableOpacity>
+                 <TouchableOpacity style={[styles.orientBtn, isLandscape && styles.orientBtnActive]} onPress={()=>setIsLandscape(true)}>
+                    <Text style={[styles.orientText, isLandscape && styles.orientTextActive]}>Landscape</Text>
+                 </TouchableOpacity>
+               </View>
+            </View>
+
+            <View style={styles.settingsActions}>
+               <TouchableOpacity style={styles.settingsCancelBtn} onPress={()=>setShowPdfSettings(false)}>
+                 <Text style={styles.settingsCancelText}>Cancel</Text>
+               </TouchableOpacity>
+               <TouchableOpacity style={styles.settingsGenerateBtn} onPress={handleGeneratePdf}>
+                 <Text style={styles.settingsGenerateText}>Generate PDF</Text>
+               </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F8FAFC' },
-  header: { padding: 20, paddingTop: 60, backgroundColor: '#FFF', borderBottomWidth: 1, borderColor: '#E2E8F0' },
+  header: { padding: 20, paddingTop: 60, backgroundColor: '#FFF', borderBottomWidth: 1, borderColor: '#E2E8F0', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   title: { fontSize: 24, fontWeight: 'bold', color: '#1E293B' },
-  subtitle: { fontSize: 13, color: '#64748B', marginTop: 4 },
-  selectBtn: { backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 20 },
-  selectBtnText: { color: '#2563EB', fontWeight: 'bold' },
-  card: { flexDirection: 'row', backgroundColor: '#FFF', padding: 20, borderRadius: 12, marginBottom: 12, borderWidth: 1, borderColor: '#E2E8F0', elevation: 1 },
-  cardSelected: { borderColor: '#2563EB', backgroundColor: '#EFF6FF', borderWidth: 2 },
-  cardCode: { fontSize: 18, fontWeight: 'bold', color: '#1E293B' },
-  cardName: { fontSize: 14, color: '#475569', marginTop: 4 },
-  photoCount: { fontSize: 14, fontWeight: 'bold', color: '#94A3B8' },
-  exportFab: { position: 'absolute', bottom: 30, left: 30, right: 30, backgroundColor: '#2563EB', flexDirection: 'row', padding: 18, borderRadius: 16, justifyContent: 'center', alignItems: 'center', elevation: 5 },
+  selectAllBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#EFF6FF', borderRadius: 8 },
+  selectAllText: { color: '#2563EB', fontWeight: 'bold', fontSize: 13 },
   
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
-  modalContent: { backgroundColor: '#FFF', padding: 25, borderTopLeftRadius: 24, borderTopRightRadius: 24 },
-  modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#1E293B' },
-  label: { fontSize: 12, fontWeight: 'bold', color: '#64748B', marginBottom: 8, textTransform: 'uppercase' },
-  input: { backgroundColor: '#F8FAFC', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0', fontSize: 18, textAlign: 'center', fontWeight: 'bold' },
-  orientationBtn: { flex: 1, padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0', alignItems: 'center', backgroundColor: '#F8FAFC' },
-  orientationBtnActive: { borderColor: '#2563EB', backgroundColor: '#EFF6FF' },
-  orientationBtnText: { fontWeight: 'bold', color: '#64748B' },
-  orientationBtnTextActive: { color: '#2563EB' },
-  primaryBtn: { backgroundColor: '#2563EB', padding: 16, borderRadius: 12, alignItems: 'center' },
+  sectionHeader: { backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 8, marginTop: 10 },
+  sectionHeaderText: { fontSize: 14, fontWeight: 'bold', color: '#64748B' },
+  
+  itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 15, marginHorizontal: 15, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0' },
+  itemCardSelected: { borderColor: '#2563EB', backgroundColor: '#EFF6FF' },
+  
+  checkbox: { width: 24, height: 24, borderRadius: 6, borderWidth: 2, borderColor: '#CBD5E1', marginRight: 15, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFF' },
+  checkboxSelected: { backgroundColor: '#2563EB', borderColor: '#2563EB' },
+  
+  itemTitle: { fontSize: 16, fontWeight: 'bold', color: '#1E293B' },
+  itemCode: { fontSize: 13, color: '#64748B', marginTop: 2 },
+  
+  photoCountBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 },
+  photoCountText: { fontSize: 12, fontWeight: 'bold', color: '#64748B' },
 
-  progressOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  progressCard: { backgroundColor: '#FFF', width: '100%', maxWidth: 350, padding: 30, borderRadius: 20, alignItems: 'center' },
-  progressTitle: { fontSize: 18, fontWeight: 'bold', color: '#1E293B', marginBottom: 5 },
-  progressSubtitle: { fontSize: 13, color: '#64748B', marginBottom: 20 },
-  progressBarBg: { width: '100%', height: 8, backgroundColor: '#E2E8F0', borderRadius: 4, overflow: 'hidden', marginBottom: 10 },
-  progressBarFill: { height: '100%', backgroundColor: '#2563EB' },
-  progressPercent: { fontSize: 14, fontWeight: 'bold', color: '#1E293B', marginBottom: 20 },
-  cancelBtn: { padding: 12, width: '100%', alignItems: 'center', backgroundColor: '#FEF2F2', borderRadius: 10 },
-  cancelBtnText: { color: '#EF4444', fontWeight: 'bold' }
+  emptyState: { alignItems: 'center', marginTop: 60 },
+  emptyStateText: { marginTop: 10, color: '#94A3B8', fontSize: 16 },
+
+  bottomToolbar: { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#FFF', borderTopWidth: 1, borderColor: '#E2E8F0', padding: 20, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', elevation: 15, shadowColor: '#000', shadowOffset: { width: 0, height: -2 }, shadowOpacity: 0.1, shadowRadius: 10 },
+  selectedCountText: { fontSize: 16, fontWeight: 'bold', color: '#1E293B' },
+  toolbarActions: { flexDirection: 'row', gap: 10 },
+  cancelBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10, backgroundColor: '#F1F5F9' },
+  cancelBtnText: { color: '#64748B', fontWeight: 'bold', fontSize: 14 },
+  exportBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10, backgroundColor: '#10B981' },
+  exportBtnText: { color: '#FFF', fontWeight: 'bold', fontSize: 14 },
+
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
+  progressCard: { backgroundColor: '#FFF', padding: 30, borderRadius: 16, width: '80%', alignItems: 'center' },
+  progressText: { fontSize: 16, color: '#1E293B', fontWeight: '600', textAlign: 'center', marginBottom: 20 },
+  stopBtn: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#FEF2F2' },
+  stopBtnText: { color: '#EF4444', fontWeight: 'bold' },
+
+  settingsCard: { backgroundColor: '#FFF', padding: 25, borderRadius: 16, width: '85%' },
+  settingsTitle: { fontSize: 20, fontWeight: 'bold', color: '#1E293B', marginBottom: 20 },
+  settingRow: { marginBottom: 20 },
+  settingLabel: { fontSize: 14, fontWeight: 'bold', color: '#64748B', marginBottom: 8, textTransform: 'uppercase' },
+  numInput: { backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#E2E8F0', padding: 10, borderRadius: 8, fontSize: 16, width: 60, textAlign: 'center' },
+  orientBtn: { flex: 1, paddingVertical: 12, borderRadius: 8, backgroundColor: '#F1F5F9', alignItems: 'center', borderWidth: 1, borderColor: '#E2E8F0' },
+  orientBtnActive: { backgroundColor: '#EFF6FF', borderColor: '#2563EB' },
+  orientText: { fontWeight: 'bold', color: '#64748B' },
+  orientTextActive: { color: '#2563EB' },
+  
+  settingsActions: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10, gap: 15 },
+  settingsCancelBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#F1F5F9' },
+  settingsCancelText: { color: '#64748B', fontWeight: 'bold' },
+  settingsGenerateBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#2563EB' },
+  settingsGenerateText: { color: '#FFF', fontWeight: 'bold' }
 });
