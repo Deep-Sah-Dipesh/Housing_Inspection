@@ -43,3 +43,6 @@ yarn-error.*
 #critical files
 google-services.json
 # firebaseConfig.ts
+
+#credentials
+credentials.json

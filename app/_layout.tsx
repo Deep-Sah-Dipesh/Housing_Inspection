@@ -1,15 +1,11 @@
 import React, { Component, ReactNode, useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, ActivityIndicator } from 'react-native';
 import { Stack } from 'expo-router';
 import { SQLiteProvider } from 'expo-sqlite';
-import * as FileSystem from 'expo-file-system';
 import * as Updates from 'expo-updates';
 import { Ionicons } from '@expo/vector-icons';
 import { initDatabase } from '../utils/database';
 
-// ------------------------------------------------------------------
-// 1. Error Boundary to catch the exact 'replace of undefined' crash
-// ------------------------------------------------------------------
 class SQLiteErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean, error: string}> {
   state = { hasError: false, error: '' };
 
@@ -40,46 +36,47 @@ class SQLiteErrorBoundary extends Component<{children: ReactNode}, {hasError: bo
   }
 }
 
-// ------------------------------------------------------------------
-// 2. Main Root Layout
-// ------------------------------------------------------------------
 export default function RootLayout() {
   const [isReady, setIsReady] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState('Initializing Secure Workspace...');
 
   useEffect(() => {
-    async function checkUpdates() {
+    async function prepareApp() {
       try {
         if (!__DEV__) {
+          setUpdateMessage('Checking for latest updates...');
+          
+          // 1. Force the app to wait and check the cloud right now
           const update = await Updates.checkForUpdateAsync();
+          
           if (update.isAvailable) {
+            setUpdateMessage('Downloading new version...');
+            // 2. Download the update while the user waits on the loading screen
             await Updates.fetchUpdateAsync();
-            Alert.alert(
-              "Update Available",
-              "A new version of the app has been downloaded. Restart now to apply?",
-              [
-                { text: "Later (Next Launch)", style: "cancel" },
-                { text: "Restart Now", onPress: () => Updates.reloadAsync() }
-              ]
-            );
+            // 3. Instantly reboot the app to the new version without asking
+            await Updates.reloadAsync(); 
+            return; // Stop execution here, because the app is restarting
           }
         }
       } catch (e) {
-        console.log("OTA Update check failed:", e);
+        console.log("OTA Update check failed (Offline mode):", e);
+      } finally {
+        // Only launch the app if there are no updates or the device is offline
+        setUpdateMessage('Starting Workspace...');
+        setTimeout(() => {
+          setIsReady(true);
+        }, 500);
       }
     }
-    checkUpdates();
-
-    // Artificial delay to ensure FileSystem is mounted before SQLite fires
-    setTimeout(() => {
-      setIsReady(true);
-    }, 500);
+    
+    prepareApp();
   }, []);
 
   if (!isReady) {
     return (
       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#F8FAFC' }}>
         <ActivityIndicator size="large" color="#2563EB" />
-        <Text style={{ marginTop: 15, color: '#64748B', fontWeight: 'bold' }}>Initializing Secure Workspace...</Text>
+        <Text style={{ marginTop: 15, color: '#64748B', fontWeight: 'bold' }}>{updateMessage}</Text>
       </View>
     );
   }

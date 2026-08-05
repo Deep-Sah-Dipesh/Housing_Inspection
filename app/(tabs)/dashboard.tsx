@@ -1,14 +1,12 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, Platform } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
-import * as FileSystem from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
-import * as IntentLauncher from 'expo-intent-launcher';
-import { exportMultipleBeneficiariesAsZip } from '../../utils/fileHelpers';
+import { exportProjects } from '../../utils/fileHelpers';
 
 interface BeneficiaryItem {
   code: string;
@@ -22,7 +20,6 @@ export default function DashboardScreen() {
   const router = useRouter();
   const [groupedData, setGroupedData] = useState<{title: string, data: BeneficiaryItem[]}[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isExporting, setIsExporting] = useState(false);
   const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
 
   // PDF Export States
@@ -34,6 +31,12 @@ export default function DashboardScreen() {
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [pdfProgressMsg, setPdfProgressMsg] = useState('');
   const cancelPdfRef = useRef(false);
+
+  // File Export States with Progress Bar Support
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgressMsg, setExportProgressMsg] = useState('');
+  const [exportProgressPercent, setExportProgressPercent] = useState(0);
+  const cancelExportRef = useRef({ current: false });
 
   useFocusEffect(
     useCallback(() => {
@@ -84,6 +87,19 @@ export default function DashboardScreen() {
     }
   };
 
+  const toggleSection = (sectionData: BeneficiaryItem[]) => {
+    const sectionCodes = sectionData.map(item => item.code);
+    const allSelected = sectionCodes.every(code => selectedCodes.includes(code));
+    
+    if (allSelected) {
+      // Remove all codes in this date section
+      setSelectedCodes(prev => prev.filter(c => !sectionCodes.includes(c)));
+    } else {
+      // Add all codes in this date section
+      setSelectedCodes(prev => Array.from(new Set([...prev, ...sectionCodes])));
+    }
+  };
+
   const handleSelectAll = () => {
     if (selectedCodes.length > 0) {
       setSelectedCodes([]);
@@ -97,26 +113,36 @@ export default function DashboardScreen() {
     if (selectedCodes.length === 0) return;
     
     Alert.alert(
-      "Export ZIP",
-      "How would you like to export these projects?",
+      "Export Projects",
+      "Would you like to compress them into a ZIP for sharing, or save the ZIP folder just to your device?",
       [
         { text: "Cancel", style: "cancel" },
         { 
-          text: "Share via App", 
+          text: "Share as ZIP", 
           onPress: async () => {
             setIsExporting(true);
-            await exportMultipleBeneficiariesAsZip(selectedCodes, 'share');
+            setExportProgressPercent(0);
+            cancelExportRef.current.current = false;
+            await exportProjects(selectedCodes, 'share', (msg, pct) => {
+               setExportProgressMsg(msg);
+               setExportProgressPercent(pct);
+            }, cancelExportRef.current);
             setIsExporting(false);
-            setSelectedCodes([]); 
+            if (!cancelExportRef.current.current) setSelectedCodes([]); 
           }
         },
         { 
-          text: "Save to Device Folder", 
+          text: "Save to Device", 
           onPress: async () => {
             setIsExporting(true);
-            await exportMultipleBeneficiariesAsZip(selectedCodes, 'save');
+            setExportProgressPercent(0);
+            cancelExportRef.current.current = false;
+            await exportProjects(selectedCodes, 'save', (msg, pct) => {
+               setExportProgressMsg(msg);
+               setExportProgressPercent(pct);
+            }, cancelExportRef.current);
             setIsExporting(false);
-            setSelectedCodes([]); 
+            if (!cancelExportRef.current.current) setSelectedCodes([]); 
           }
         }
       ]
@@ -147,8 +173,6 @@ export default function DashboardScreen() {
         if (cancelPdfRef.current) throw new Error("Cancelled by user");
         
         setPdfProgressMsg(`Compressing image ${i + 1} of ${photos.length}...`);
-        
-        // Rapid compression & Base64 conversion to prevent memory crashes
         const manipResult = await ImageManipulator.manipulateAsync(
           photos[i].local_uri,
           [{ resize: { width: 800 } }],
@@ -168,14 +192,13 @@ export default function DashboardScreen() {
       const itemsPerPage = rows * cols;
       let pagesHtml = '';
 
-      // Strict Pagination to map images perfectly into A4 pages
       for (let i = 0; i < processedPhotos.length; i += itemsPerPage) {
         if (cancelPdfRef.current) throw new Error("Cancelled by user");
         const chunk = processedPhotos.slice(i, i + itemsPerPage);
         
         pagesHtml += `<div class="page">`;
         chunk.forEach(photo => {
-          const caption = photo.filename.replace(/\.[^/.]+$/, ""); // Removes .jpg extension
+          const caption = photo.filename.replace(/\.[^/.]+$/, "");
           pagesHtml += `
             <div class="img-cell">
               <img src="data:image/jpeg;base64,${photo.base64}" />
@@ -205,31 +228,9 @@ export default function DashboardScreen() {
               grid-template-rows: repeat(${rows}, 1fr);
               gap: 10mm;
             }
-            .img-cell {
-              display: flex;
-              flex-direction: column;
-              align-items: center;
-              justify-content: center;
-              width: 100%;
-              height: 100%;
-              overflow: hidden;
-            }
-            .img-cell img {
-              max-width: 100%;
-              max-height: 85%;
-              object-fit: contain;
-              border: 1px solid #CBD5E1;
-              border-radius: 4px;
-            }
-            .caption {
-              margin-top: 8px;
-              font-size: 11px;
-              color: #1E293B;
-              text-align: center;
-              word-wrap: break-word;
-              max-width: 100%;
-              line-height: 1.4;
-            }
+            .img-cell { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; overflow: hidden; }
+            .img-cell img { max-width: 100%; max-height: 85%; object-fit: contain; border: 1px solid #CBD5E1; border-radius: 4px; }
+            .caption { margin-top: 8px; font-size: 11px; color: #1E293B; text-align: center; word-wrap: break-word; max-width: 100%; line-height: 1.4; }
           </style>
         </head>
         <body>
@@ -239,24 +240,10 @@ export default function DashboardScreen() {
       `;
 
       const { uri } = await Print.printToFileAsync({ html });
-
-      // Open natively in device PDF viewer
-      if (Platform.OS === 'android') {
-        const contentUri = await FileSystem.getContentUriAsync(uri);
-        await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
-          data: contentUri,
-          flags: 1,
-          type: 'application/pdf'
-        });
-      } else {
-        await Sharing.shareAsync(uri, { UTI: 'com.adobe.pdf', mimeType: 'application/pdf' });
-      }
-
-      setSelectedCodes([]); // Reset selection on success
+      await Sharing.shareAsync(uri, { UTI: 'com.adobe.pdf', mimeType: 'application/pdf' });
+      setSelectedCodes([]); 
     } catch (error: any) {
-      if (error.message !== "Cancelled by user") {
-        Alert.alert("Export Failed", "Could not generate PDF document.");
-      }
+      if (error.message !== "Cancelled by user") Alert.alert("Export Failed", "Could not generate PDF document.");
     } finally {
       setIsGeneratingPdf(false);
     }
@@ -273,7 +260,12 @@ export default function DashboardScreen() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>Export Dashboard</Text>
+        <View style={{flex: 1}}>
+           <Text style={styles.title}>Export Dashboard</Text>
+           <Text style={styles.headerSubtitle}>
+             {selectedCodes.length === 0 ? "No projects selected" : `${selectedCodes.length} Project${selectedCodes.length > 1 ? 's' : ''} Selected for Export`}
+           </Text>
+        </View>
         <TouchableOpacity style={styles.selectAllBtn} onPress={handleSelectAll}>
           <Text style={styles.selectAllText}>
             {selectedCodes.length > 0 ? 'Deselect All' : 'Select All'}
@@ -285,11 +277,22 @@ export default function DashboardScreen() {
         sections={groupedData}
         keyExtractor={(item) => item.code}
         contentContainerStyle={{ paddingBottom: 120 }} 
-        renderSectionHeader={({ section: { title } }) => (
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionHeaderText}>{title}</Text>
-          </View>
-        )}
+        renderSectionHeader={({ section: { title, data } }) => {
+          const isAllSelected = data.every(item => selectedCodes.includes(item.code));
+          return (
+            <TouchableOpacity 
+              style={styles.sectionHeader} 
+              activeOpacity={0.7} 
+              onPress={() => toggleSection(data)}
+            >
+              <View style={[styles.checkbox, isAllSelected && styles.checkboxSelected, { width: 20, height: 20, marginRight: 10 }]}>
+                {isAllSelected && <Ionicons name="checkmark" size={14} color="#FFF" />}
+              </View>
+              <Text style={styles.sectionHeaderText}>{title}</Text>
+              <Text style={styles.sectionCountText}>{data.length} Projects</Text>
+            </TouchableOpacity>
+          );
+        }}
         renderItem={({ item }) => {
           const isSelected = selectedCodes.includes(item.code);
           return (
@@ -329,7 +332,6 @@ export default function DashboardScreen() {
         }
       />
 
-      {/* Slide-Up Action Toolbar */}
       {selectedCodes.length > 0 && (
         <View style={styles.bottomToolbar}>
           <Text style={styles.selectedCountText}>{selectedCodes.length} Selected</Text>
@@ -339,39 +341,57 @@ export default function DashboardScreen() {
               <Text style={styles.cancelBtnText}>Clear</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#2563EB'}]} onPress={() => setShowPdfSettings(true)} disabled={isExporting}>
+            <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#2563EB'}]} onPress={() => setShowPdfSettings(true)}>
               <Ionicons name="document-text" size={18} color="#FFF" style={{ marginRight: 6 }} />
               <Text style={styles.exportBtnText}>PDF</Text>
             </TouchableOpacity>
             
-            <TouchableOpacity style={styles.exportBtn} onPress={handleBulkZipExport} disabled={isExporting}>
-              {isExporting ? (
-                <ActivityIndicator size="small" color="#FFF" />
-              ) : (
-                <>
-                  <Ionicons name="archive" size={18} color="#FFF" style={{ marginRight: 6 }} />
-                  <Text style={styles.exportBtnText}>ZIP</Text>
-                </>
-              )}
+            <TouchableOpacity style={styles.exportBtn} onPress={handleBulkZipExport}>
+              <Ionicons name="folder-open" size={18} color="#FFF" style={{ marginRight: 6 }} />
+              <Text style={styles.exportBtnText}>Files</Text>
             </TouchableOpacity>
           </View>
         </View>
       )}
 
-      {/* PDF Generation Progress Modal */}
-      <Modal visible={isGeneratingPdf} transparent animationType="fade">
+      {/* Real Progress Bar Modal */}
+      <Modal visible={isExporting} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
-            <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 15 }} />
-            <Text style={styles.progressText}>{pdfProgressMsg}</Text>
-            <TouchableOpacity style={styles.stopBtn} onPress={() => cancelPdfRef.current = true}>
+            <Text style={styles.progressTitle}>Saving to Device...</Text>
+            
+            <View style={styles.progressBarBg}>
+               <View style={[styles.progressBarFill, { width: `${exportProgressPercent}%` }]} />
+            </View>
+            
+            <Text style={styles.progressPercentText}>{exportProgressPercent}%</Text>
+            <Text style={styles.progressText}>{exportProgressMsg}</Text>
+            
+            <TouchableOpacity style={styles.stopBtn} onPress={() => {
+              cancelExportRef.current.current = true;
+              setIsExporting(false);
+            }}>
               <Text style={styles.stopBtnText}>Cancel</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* PDF Settings Modal */}
+      <Modal visible={isGeneratingPdf} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.progressCard}>
+            <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 15 }} />
+            <Text style={styles.progressText}>{pdfProgressMsg}</Text>
+            <TouchableOpacity style={styles.stopBtn} onPress={() => {
+              cancelPdfRef.current = true;
+              setIsGeneratingPdf(false);
+            }}>
+              <Text style={styles.stopBtnText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={showPdfSettings} transparent animationType="slide">
         <View style={styles.modalOverlay}>
           <View style={styles.settingsCard}>
@@ -418,11 +438,13 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F8FAFC' },
   header: { padding: 20, paddingTop: 60, backgroundColor: '#FFF', borderBottomWidth: 1, borderColor: '#E2E8F0', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   title: { fontSize: 24, fontWeight: 'bold', color: '#1E293B' },
+  headerSubtitle: { fontSize: 13, fontWeight: 'bold', color: '#10B981', marginTop: 4 },
   selectAllBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#EFF6FF', borderRadius: 8 },
   selectAllText: { color: '#2563EB', fontWeight: 'bold', fontSize: 13 },
   
-  sectionHeader: { backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 8, marginTop: 10 },
-  sectionHeaderText: { fontSize: 14, fontWeight: 'bold', color: '#64748B' },
+  sectionHeader: { backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 12, marginTop: 10, flexDirection: 'row', alignItems: 'center', borderTopWidth: 1, borderBottomWidth: 1, borderColor: '#E2E8F0' },
+  sectionHeaderText: { fontSize: 15, fontWeight: 'bold', color: '#334155' },
+  sectionCountText: { marginLeft: 'auto', fontSize: 13, color: '#64748B', fontWeight: '600' },
   
   itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 15, marginHorizontal: 15, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0' },
   itemCardSelected: { borderColor: '#2563EB', backgroundColor: '#EFF6FF' },
@@ -448,8 +470,12 @@ const styles = StyleSheet.create({
   exportBtnText: { color: '#FFF', fontWeight: 'bold', fontSize: 14 },
 
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
-  progressCard: { backgroundColor: '#FFF', padding: 30, borderRadius: 16, width: '80%', alignItems: 'center' },
-  progressText: { fontSize: 16, color: '#1E293B', fontWeight: '600', textAlign: 'center', marginBottom: 20 },
+  progressCard: { backgroundColor: '#FFF', padding: 30, borderRadius: 16, width: '85%', alignItems: 'center' },
+  progressTitle: { fontSize: 18, fontWeight: 'bold', color: '#1E293B', marginBottom: 15 },
+  progressBarBg: { width: '100%', height: 12, backgroundColor: '#E2E8F0', borderRadius: 6, overflow: 'hidden', marginBottom: 10 },
+  progressBarFill: { height: '100%', backgroundColor: '#10B981' },
+  progressPercentText: { fontSize: 16, fontWeight: 'bold', color: '#10B981', marginBottom: 5 },
+  progressText: { fontSize: 14, color: '#64748B', textAlign: 'center', marginBottom: 20 },
   stopBtn: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#FEF2F2' },
   stopBtnText: { color: '#EF4444', fontWeight: 'bold' },
 
@@ -462,7 +488,6 @@ const styles = StyleSheet.create({
   orientBtnActive: { backgroundColor: '#EFF6FF', borderColor: '#2563EB' },
   orientText: { fontWeight: 'bold', color: '#64748B' },
   orientTextActive: { color: '#2563EB' },
-  
   settingsActions: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10, gap: 15 },
   settingsCancelBtn: { paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#F1F5F9' },
   settingsCancelText: { color: '#64748B', fontWeight: 'bold' },

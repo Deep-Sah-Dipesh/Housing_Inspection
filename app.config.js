@@ -3,14 +3,15 @@ export default {
     name: "Housing Inspection",
     slug: "Housing_Inspection",
     scheme: "com.deepsah.housinginspection",
-    version: "1.1.3",
+    version: "1.2.1",
     orientation: "portrait",
     icon: "./assets/Housing_Inspection_Logo.png",
     userInterfaceStyle: "light",
 
     // --- EAS UPDATE SETTINGS ---
     updates: {
-      url: "https://u.expo.dev/ffe75714-4533-4d6f-927e-9a679e0a8db3"
+      url: "https://u.expo.dev/ffe75714-4533-4d6f-927e-9a679e0a8db3",
+      channel: "preview"
     },
     runtimeVersion: {
       policy: "appVersion"
@@ -19,11 +20,11 @@ export default {
 
     ios: {
       supportsTablet: true,
-      buildNumber: "3",
+      buildNumber: "5",
     },
 
     android: {
-      versionCode: 1,
+      versionCode: 5,
       adaptiveIcon: {
         backgroundColor: "#E6F4FE",
         foregroundImage: "./assets/android-icon-foreground.png",
