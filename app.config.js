@@ -3,7 +3,7 @@ export default {
     name: "Housing Inspection",
     slug: "Housing_Inspection",
     scheme: "com.deepsah.housinginspection",
-    version: "1.2.1",
+    version: "2.1.1",
     orientation: "portrait",
     icon: "./assets/Housing_Inspection_Logo.png",
     userInterfaceStyle: "light",
@@ -20,11 +20,11 @@ export default {
 
     ios: {
       supportsTablet: true,
-      buildNumber: "5",
+      buildNumber: "6",
     },
 
     android: {
-      versionCode: 5,
+      versionCode: 6,
       adaptiveIcon: {
         backgroundColor: "#E6F4FE",
         foregroundImage: "./assets/android-icon-foreground.png",

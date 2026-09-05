@@ -1,14 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { useRouter } from 'expo-router';
+import { Redirect, useRootNavigationState } from 'expo-router';
 import { useAppStore } from '../store/appStore';
 
 export default function AuthScreen() {
-  const router = useRouter();
-  const setAuth = useAppStore((state) => state.setAuth);
-  const userId = useAppStore((state) => state.userId);
-  const _hasHydrated = useAppStore((state) => state._hasHydrated);
+  const rootNavigationState = useRootNavigationState();
+  const { setAuth, userId, _hasHydrated } = useAppStore();
 
   const [isLogin, setIsLogin] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -16,12 +14,20 @@ export default function AuthScreen() {
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
 
-  // Wait for the local storage to load, then instantly bypass if logged in
-  useEffect(() => {
-    if (_hasHydrated && userId) {
-      router.replace('/(tabs)/beneficiaries');
-    }
-  }, [_hasHydrated, userId]);
+  // 1. SAFEGUARD: Wait for router and storage to mount
+  if (!rootNavigationState?.key || !_hasHydrated) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#F8FAFC' }}>
+        <ActivityIndicator size="large" color="#2563EB" />
+        <Text style={{ marginTop: 10, color: '#64748B', fontWeight: 'bold' }}>Loading Workspace...</Text>
+      </View>
+    );
+  }
+
+  // 2. PERSISTENCE: If user is logged in, redirect instantly
+  if (userId) {
+    return <Redirect href="/(tabs)/beneficiaries" />;
+  }
 
   const handleAuth = async () => {
     if (!identifier || !password) {
@@ -29,31 +35,14 @@ export default function AuthScreen() {
     }
     
     setLoading(true);
-
-    // Extract name from email if Full Name wasn't provided
     const extractedName = identifier.split('@')[0];
     const finalName = !isLogin && fullName.trim() ? fullName.trim() : extractedName;
 
-    // Simulate Authentication 
     setTimeout(() => {
       setLoading(false);
       setAuth(identifier.toLowerCase().trim(), finalName);
-      router.replace('/(tabs)/beneficiaries');
-    }, 1500);
+    }, 800);
   };
-
-  // Show a loading screen while checking device storage to prevent login flashes
-  if (!_hasHydrated) {
-    return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#F8FAFC' }}>
-        <ActivityIndicator size="large" color="#2563EB" />
-        <Text style={{ marginTop: 10, color: '#64748B', fontWeight: 'bold' }}>Verifying Identity...</Text>
-      </View>
-    );
-  }
-
-  // Double-safety check to hide UI if transitioning
-  if (userId) return null;
 
   return (
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.container}>

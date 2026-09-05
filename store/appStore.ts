@@ -5,12 +5,13 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 interface AppState {
   userId: string | null;
   userName: string | null;
-  isSyncing: boolean;
+  district: string | null;
+  city: string | null;
   _hasHydrated: boolean;
-  
   setAuth: (id: string, name: string) => void;
   logout: () => void;
-  setSyncing: (status: boolean) => void;
+  setFilters: (district: string | null, city: string | null) => void;
+  clearFilters: () => void;
   setHasHydrated: (state: boolean) => void;
 }
 
@@ -19,26 +20,21 @@ export const useAppStore = create<AppState>()(
     (set) => ({
       userId: null,
       userName: null,
-      isSyncing: false,
+      district: null,
+      city: null,
       _hasHydrated: false,
-      
-      setAuth: (id, name) => set({ userId: id, userName: name }),
-      
-      logout: () => set({ userId: null, userName: null }),
-      
-      setSyncing: (status) => set({ isSyncing: status }),
 
-      setHasHydrated: (state) => set({ _hasHydrated: state }),
+      setAuth: (id: string, name: string) => set({ userId: id, userName: name }),
+      logout: () => set({ userId: null, userName: null, district: null, city: null }),
+      setFilters: (district: string | null, city: string | null) => set({ district, city }),
+      clearFilters: () => set({ district: null, city: null }),
+      setHasHydrated: (state: boolean) => set({ _hasHydrated: state }),
     }),
     {
-      name: 'housing-inspection-storage', // The unique key for local storage
+      name: 'housing-inspection-storage',
       storage: createJSONStorage(() => AsyncStorage),
       onRehydrateStorage: () => (state) => {
-        // When AsyncStorage finishes loading the saved data from the hard drive,
-        // we tell the app it is ready to skip the login screen.
-        if (state) {
-          state.setHasHydrated(true);
-        }
+        state?.setHasHydrated(true);
       },
     }
   )
