@@ -20,6 +20,25 @@ interface Beneficiary {
 const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Inspection Pending', 'Recently Inspected'] as const;
 type SortMode = typeof SORT_OPTIONS[number];
 
+const getShortSortName = (sort: SortMode) => {
+  if (sort === 'Recently Inspected') return 'Recent';
+  if (sort === 'Inspection Pending') return 'Pending';
+  if (sort === 'Name A-Z') return 'A-Z';
+  if (sort === 'Name Z-A') return 'Z-A';
+  return sort;
+};
+
+const toTitleCase = (str?: string | null) => {
+  if (!str) return 'N/A';
+  let cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  return cleanStr.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase());
+};
+
+const getFirstWord = (str?: string | null) => {
+  if (!str || str === 'N/A' || str === 'All Cities' || str === 'All Districts') return str;
+  return str.split(/[\s,]+/)[0].replace(/[^a-zA-Z0-9]/g, '');
+};
+
 export default function BeneficiariesScreen() {
   const db = useSQLiteContext();
   const router = useRouter();
@@ -113,7 +132,7 @@ export default function BeneficiariesScreen() {
               const isSelected = district === opt || (!district && opt === 'All Districts');
               return (
                 <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setFilters(opt === 'All Districts' ? null : opt, null); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt}</Text>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Districts' ? 'All Districts' : toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -121,7 +140,7 @@ export default function BeneficiariesScreen() {
               const isSelected = city === opt || (!city && opt === 'All Cities');
               return (
                 <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setFilters(district, opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt}</Text>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Cities' ? 'All Cities' : toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -153,23 +172,30 @@ export default function BeneficiariesScreen() {
           )}
         </View>
 
-        <View style={styles.filterBar}>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('district')}>
-            <Text style={styles.filterBtnText} numberOfLines={1}>{district || 'All Districts'}</Text>
-            <Ionicons name="chevron-down" size={14} color="#64748B" />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('city')}>
-            <Text style={styles.filterBtnText} numberOfLines={1}>{city || 'All Cities'}</Text>
-            <Ionicons name="chevron-down" size={14} color="#64748B" />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('sort')}>
-            <Ionicons name="swap-vertical" size={14} color="#64748B" style={{marginRight: 4}} />
-            <Text style={styles.filterBtnText} numberOfLines={1}>{sortMode}</Text>
-          </TouchableOpacity>
-          {(district || city || sortMode !== 'Name A-Z') && (
-            <TouchableOpacity onPress={() => { clearFilters(); setSortMode('Name A-Z'); setSearchQuery(''); }} style={styles.clearBtn}>
-              <Ionicons name="close-circle" size={22} color="#EF4444" />
+        <View style={styles.filterWrapper}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }} contentContainerStyle={styles.filterScrollContent}>
+            <TouchableOpacity style={[styles.filterBtn, district && styles.filterBtnActive]} onPress={() => setActiveDropdown('district')}>
+              <Text style={[styles.filterBtnText, district && styles.filterBtnTextActive]} numberOfLines={1}>{district ? toTitleCase(district) : 'District'}</Text>
+              <Ionicons name="chevron-down" size={14} color={district ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
+            
+            <TouchableOpacity style={[styles.filterBtn, city && styles.filterBtnActive]} onPress={() => setActiveDropdown('city')}>
+              <Text style={[styles.filterBtnText, city && styles.filterBtnTextActive]} numberOfLines={1}>{city ? getFirstWord(toTitleCase(city)) : 'City'}</Text>
+              <Ionicons name="chevron-down" size={14} color={city ? "#2563EB" : "#64748B"} />
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={[styles.filterBtn, sortMode !== 'Name A-Z' && styles.filterBtnActive]} onPress={() => setActiveDropdown('sort')}>
+              <Ionicons name="swap-vertical" size={14} color={sortMode !== 'Name A-Z' ? "#2563EB" : "#64748B"} style={{marginRight: 4}} />
+              <Text style={[styles.filterBtnText, sortMode !== 'Name A-Z' && styles.filterBtnTextActive]} numberOfLines={1}>{getShortSortName(sortMode)}</Text>
+            </TouchableOpacity>
+          </ScrollView>
+
+          {(district || city || sortMode !== 'Name A-Z') && (
+            <View style={{ paddingLeft: 8 }}>
+              <TouchableOpacity onPress={() => { clearFilters(); setSortMode('Name A-Z'); setSearchQuery(''); }} style={styles.fixedClearBtn}>
+                <Ionicons name="close-circle" size={26} color="#EF4444" />
+              </TouchableOpacity>
+            </View>
           )}
         </View>
       </View>
@@ -184,22 +210,23 @@ export default function BeneficiariesScreen() {
             return (
               <TouchableOpacity style={[styles.card, hasPhotos && styles.cardWithPhotos]} onPress={() => router.push(`/beneficiary/${item.code}`)}>
                 <View style={styles.cardHeaderInfo}>
-                  <Text style={styles.itemTitle}>{item.name}</Text>
+                  <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
                 </View>
                 <View style={styles.cardSubRow}>
+                  <Text style={styles.itemCode}>ID: {item.code}</Text>
+                  
                   <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                    <Text style={styles.itemCode}>ID: {item.code}</Text>
-                    {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 6 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 6 }} />}
+                    {hasPhotos && (
+                      <View style={styles.photoCountBadge}>
+                        <Text style={styles.photoCountText}>{item.photo_count}</Text>
+                        <Ionicons name="images" size={12} color="#10B981" style={{ marginLeft: 4 }} />
+                      </View>
+                    )}
+                    {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
                   </View>
-                  {hasPhotos && (
-                    <View style={styles.photoCountBadge}>
-                      <Ionicons name="images" size={12} color="#10B981" style={{ marginRight: 4 }} />
-                      <Text style={styles.photoCountText}>{item.photo_count}</Text>
-                    </View>
-                  )}
                 </View>
                 <View style={styles.cardFooter}>
-                  <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {item.city_name || 'N/A'}, {item.district_name || 'N/A'}</Text>
+                  <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {toTitleCase(item.city_name) || 'N/A'}, {toTitleCase(item.district_name) || 'N/A'}</Text>
                 </View>
               </TouchableOpacity>
             );
@@ -254,10 +281,15 @@ const styles = StyleSheet.create({
   addBtnText: { color: '#FFF', fontWeight: 'bold', marginLeft: 4 },
   searchContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 15, paddingVertical: 10, marginBottom: 10 },
   searchInput: { flex: 1, marginLeft: 10, marginRight: 5, fontSize: 16, color: '#1E293B' },
-  filterBar: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  filterBtn: { flex: 1, flexDirection: 'row', backgroundColor: '#F1F5F9', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E2E8F0' },
-  filterBtnText: { fontSize: 12, color: '#334155', fontWeight: 'bold' },
-  clearBtn: { padding: 2 },
+  
+  filterWrapper: { flexDirection: 'row', alignItems: 'center', width: '100%' },
+  filterScrollContent: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  filterBtn: { flexDirection: 'row', backgroundColor: '#F1F5F9', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E2E8F0' },
+  filterBtnActive: { backgroundColor: '#EFF6FF', borderColor: '#2563EB' },
+  filterBtnText: { fontSize: 13, color: '#334155', fontWeight: 'bold', marginRight: 4 },
+  filterBtnTextActive: { color: '#2563EB' },
+  fixedClearBtn: { padding: 2, backgroundColor: '#FFF', borderRadius: 16 },
+  
   card: { backgroundColor: '#FFF', padding: 16, borderRadius: 12, marginBottom: 12, borderWidth: 1, borderColor: '#E2E8F0', elevation: 2 },
   cardWithPhotos: { borderColor: '#10B981', backgroundColor: '#F0FDF4' },
   cardHeaderInfo: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },

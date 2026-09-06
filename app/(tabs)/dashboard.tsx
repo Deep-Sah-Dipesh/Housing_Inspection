@@ -10,7 +10,6 @@ import * as ImageManipulator from 'expo-image-manipulator';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { generateZipArchive } from '../../utils/fileHelpers';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useAppStore } from '../../store/appStore';
 
 interface BeneficiaryItem {
   code: string;
@@ -23,20 +22,40 @@ interface BeneficiaryItem {
   last_updated: string;
 }
 
-const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Inspection Pending', 'Recently Inspected'] as const;
+const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Recently Inspected'] as const;
 type SortMode = typeof SORT_OPTIONS[number];
+
+const getShortSortName = (sort: SortMode) => {
+  if (sort === 'Recently Inspected') return 'Recent';
+  if (sort === 'Name A-Z') return 'A-Z';
+  if (sort === 'Name Z-A') return 'Z-A';
+  return sort;
+};
+
+const toTitleCase = (str?: string | null) => {
+  if (!str) return 'N/A';
+  let cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  return cleanStr.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase());
+};
+
+const getFirstWord = (str?: string | null) => {
+  if (!str || str === 'N/A' || str === 'All Cities' || str === 'All Districts') return str;
+  return str.split(/[\s,]+/)[0].replace(/[^a-zA-Z0-9]/g, '');
+};
 
 export default function DashboardScreen() {
   const db = useSQLiteContext();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { district, city, setFilters, clearFilters } = useAppStore();
+  
+  const [dashDistrict, setDashDistrict] = useState<string | null>(null);
+  const [dashCity, setDashCity] = useState<string | null>(null);
   
   const [groupedData, setGroupedData] = useState<{title: string, dateObj: Date, data: BeneficiaryItem[]}[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
   
-  const [sortMode, setSortMode] = useState<SortMode>('Name A-Z');
+  const [sortMode, setSortMode] = useState<SortMode>('Recently Inspected');
   const [searchQuery, setSearchQuery] = useState('');
   
   const [uniqueDistricts, setUniqueDistricts] = useState<string[]>([]);
@@ -63,12 +82,12 @@ export default function DashboardScreen() {
 
       let cityQuery = `SELECT DISTINCT city_name FROM beneficiaries WHERE city_name IS NOT NULL AND city_name != ''`;
       const cityParams: string[] = [];
-      if (district) { cityQuery += ` AND district_name = ?`; cityParams.push(district); }
+      if (dashDistrict) { cityQuery += ` AND district_name = ?`; cityParams.push(dashDistrict); }
       cityQuery += ` ORDER BY city_name ASC`;
       const cits = await db.getAllAsync<{city_name: string}>(cityQuery, cityParams);
       setUniqueCities(cits.map(c => c.city_name));
     } catch (error) {}
-  }, [db, district]);
+  }, [db, dashDistrict]);
 
   const loadGroupedBeneficiaries = useCallback(async () => {
     setIsLoading(true);
@@ -85,20 +104,19 @@ export default function DashboardScreen() {
         query += ` AND (b.name LIKE ? OR b.code LIKE ?)`;
         params.push(`%${searchQuery}%`, `%${searchQuery}%`);
       }
-      if (district) {
+      if (dashDistrict) {
         query += ` AND b.district_name = ?`;
-        params.push(district);
+        params.push(dashDistrict);
       }
-      if (city) {
+      if (dashCity) {
         query += ` AND b.city_name = ?`;
-        params.push(city);
+        params.push(dashCity);
       }
 
       query += ` GROUP BY b.code`;
 
       if (sortMode === 'Name A-Z') query += ` ORDER BY b.name ASC`;
       else if (sortMode === 'Name Z-A') query += ` ORDER BY b.name DESC`;
-      else if (sortMode === 'Inspection Pending') query += ` ORDER BY CASE WHEN b.inspection_status = 'pending' THEN 0 ELSE 1 END, last_updated DESC`;
       else query += ` ORDER BY last_updated DESC`;
 
       const results = await db.getAllAsync<BeneficiaryItem>(query, params);
@@ -121,7 +139,7 @@ export default function DashboardScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [db, searchQuery, district, city, sortMode]);
+  }, [db, searchQuery, dashDistrict, dashCity, sortMode]);
 
   useFocusEffect(
     useCallback(() => {
@@ -197,6 +215,14 @@ export default function DashboardScreen() {
 
     try {
       const placeholders = selectedCodes.map(() => '?').join(',');
+      
+      const countResult = await db.getFirstAsync<{total: number}>(`
+        SELECT COUNT(p.id) as total FROM beneficiaries b 
+        INNER JOIN photos p ON p.beneficiary_code = b.code 
+        WHERE b.code IN (${placeholders})
+      `, selectedCodes);
+      const totalExpectedPhotos = countResult?.total || 1;
+
       const query = `
         SELECT b.code, b.name, COALESCE(NULLIF(b.city_name, ''), 'Unknown_City') as assigned_city, MIN(p.created_at) as earliest_photo
         FROM beneficiaries b
@@ -230,7 +256,9 @@ export default function DashboardScreen() {
           for (let j = 0; j < photos.length; j++) {
             if (cancelRef.current.current) throw new Error("Cancelled by user");
             const photo = photos[j];
-            setProgressMsg(`Compressing image ${totalPhotosGlobal + 1}...`);
+            
+            setProgressPercent(Math.round(((totalPhotosGlobal + 1) / totalExpectedPhotos) * 100));
+            setProgressMsg(`Compressing image ${totalPhotosGlobal + 1} of ${totalExpectedPhotos}...`);
             
             const manipResult = await ImageManipulator.manipulateAsync(
               photo.local_uri, [{ resize: { width: 800 } }], { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
@@ -337,18 +365,22 @@ export default function DashboardScreen() {
               </TouchableOpacity>
             ))}
             {activeDropdown === 'district' && ['All Districts', ...uniqueDistricts].map((opt) => {
-              const isSelected = district === opt || (!district && opt === 'All Districts');
+              const isSelected = dashDistrict === opt || (!dashDistrict && opt === 'All Districts');
               return (
-                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setFilters(opt === 'All Districts' ? null : opt, null); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt}</Text>
+                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { 
+                  setDashDistrict(opt === 'All Districts' ? null : opt); 
+                  setDashCity(null); 
+                  setActiveDropdown(null); 
+                }}>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Districts' ? 'All Districts' : toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
             {activeDropdown === 'city' && ['All Cities', ...uniqueCities].map((opt) => {
-              const isSelected = city === opt || (!city && opt === 'All Cities');
+              const isSelected = dashCity === opt || (!dashCity && opt === 'All Cities');
               return (
-                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setFilters(district, opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt}</Text>
+                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashCity(opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Cities' ? 'All Cities' : toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -378,23 +410,30 @@ export default function DashboardScreen() {
           )}
         </View>
 
-        <View style={styles.filterBar}>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('district')}>
-            <Text style={styles.filterBtnText} numberOfLines={1}>{district || 'All Districts'}</Text>
-            <Ionicons name="chevron-down" size={14} color="#64748B" />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('city')}>
-            <Text style={styles.filterBtnText} numberOfLines={1}>{city || 'All Cities'}</Text>
-            <Ionicons name="chevron-down" size={14} color="#64748B" />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.filterBtn} onPress={() => setActiveDropdown('sort')}>
-            <Ionicons name="swap-vertical" size={14} color="#64748B" style={{marginRight: 4}} />
-            <Text style={styles.filterBtnText} numberOfLines={1}>{sortMode}</Text>
-          </TouchableOpacity>
-          {(district || city || sortMode !== 'Name A-Z') && (
-            <TouchableOpacity onPress={() => { clearFilters(); setSortMode('Name A-Z'); setSearchQuery(''); }} style={styles.clearBtn}>
-              <Ionicons name="close-circle" size={22} color="#EF4444" />
+        <View style={styles.filterWrapper}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }} contentContainerStyle={styles.filterScrollContent}>
+            <TouchableOpacity style={[styles.filterBtn, dashDistrict && styles.filterBtnActive]} onPress={() => setActiveDropdown('district')}>
+              <Text style={[styles.filterBtnText, dashDistrict && styles.filterBtnTextActive]} numberOfLines={1}>{dashDistrict ? toTitleCase(dashDistrict) : 'District'}</Text>
+              <Ionicons name="chevron-down" size={14} color={dashDistrict ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
+            
+            <TouchableOpacity style={[styles.filterBtn, dashCity && styles.filterBtnActive]} onPress={() => setActiveDropdown('city')}>
+              <Text style={[styles.filterBtnText, dashCity && styles.filterBtnTextActive]} numberOfLines={1}>{dashCity ? getFirstWord(toTitleCase(dashCity)) : 'City'}</Text>
+              <Ionicons name="chevron-down" size={14} color={dashCity ? "#2563EB" : "#64748B"} />
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={[styles.filterBtn, sortMode !== 'Recently Inspected' && styles.filterBtnActive]} onPress={() => setActiveDropdown('sort')}>
+              <Ionicons name="swap-vertical" size={14} color={sortMode !== 'Recently Inspected' ? "#2563EB" : "#64748B"} style={{marginRight: 4}} />
+              <Text style={[styles.filterBtnText, sortMode !== 'Recently Inspected' && styles.filterBtnTextActive]} numberOfLines={1}>{getShortSortName(sortMode)}</Text>
+            </TouchableOpacity>
+          </ScrollView>
+
+          {(dashDistrict || dashCity || sortMode !== 'Recently Inspected') && (
+            <View style={{ paddingLeft: 8 }}>
+              <TouchableOpacity onPress={() => { setDashDistrict(null); setDashCity(null); setSortMode('Recently Inspected'); setSearchQuery(''); }} style={styles.fixedClearBtn}>
+                <Ionicons name="close-circle" size={26} color="#EF4444" />
+              </TouchableOpacity>
+            </View>
           )}
         </View>
       </View>
@@ -429,20 +468,21 @@ export default function DashboardScreen() {
                 </TouchableOpacity>
                 <TouchableOpacity style={{ flex: 1 }} onPress={() => { if (selectedCodes.length > 0) toggleSelection(item.code); else router.push(`/beneficiary/${encodeURIComponent(item.code)}`); }} onLongPress={() => toggleSelection(item.code)}>
                   <View style={styles.cardHeaderInfo}>
-                    <Text style={styles.itemTitle}>{item.name}</Text>
+                    <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
                   </View>
                   <View style={styles.cardSubRow}>
+                    <Text style={styles.itemCode}>ID: {item.code}</Text>
+                    
                     <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                      <Text style={styles.itemCode}>ID: {item.code}</Text>
-                      {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 6 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 6 }} />}
-                    </View>
-                    <View style={styles.photoCountBadge}>
-                      <Ionicons name="images" size={12} color="#10B981" style={{ marginRight: 4 }} />
-                      <Text style={styles.photoCountText}>{item.photo_count}</Text>
+                      <View style={styles.photoCountBadge}>
+                        <Text style={styles.photoCountText}>{item.photo_count}</Text>
+                        <Ionicons name="images" size={12} color="#10B981" style={{ marginLeft: 4 }} />
+                      </View>
+                      {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
                     </View>
                   </View>
                   <View style={styles.cardFooter}>
-                    <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {item.city_name || 'N/A'}, {item.district_name || 'N/A'}</Text>
+                    <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {toTitleCase(item.city_name) || 'N/A'}, {toTitleCase(item.district_name) || 'N/A'}</Text>
                   </View>
                 </TouchableOpacity>
               </View>
@@ -542,10 +582,15 @@ const styles = StyleSheet.create({
   title: { fontSize: 24, fontWeight: 'bold', color: '#1E293B' },
   searchContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 15, paddingVertical: 10, marginBottom: 10 },
   searchInput: { flex: 1, marginLeft: 10, marginRight: 5, fontSize: 16, color: '#1E293B' },
-  filterBar: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  filterBtn: { flex: 1, flexDirection: 'row', backgroundColor: '#F1F5F9', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E2E8F0' },
-  filterBtnText: { fontSize: 13, color: '#334155', fontWeight: 'bold' },
-  clearBtn: { padding: 2 },
+  
+  filterWrapper: { flexDirection: 'row', alignItems: 'center', width: '100%' },
+  filterScrollContent: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  filterBtn: { flexDirection: 'row', backgroundColor: '#F1F5F9', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E2E8F0' },
+  filterBtnActive: { backgroundColor: '#EFF6FF', borderColor: '#2563EB' },
+  filterBtnText: { fontSize: 13, color: '#334155', fontWeight: 'bold', marginRight: 4 },
+  filterBtnTextActive: { color: '#2563EB' },
+  fixedClearBtn: { padding: 2, backgroundColor: '#FFF', borderRadius: 16 },
+  
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 10, borderTopWidth: 1, borderBottomWidth: 1, borderColor: '#E2E8F0' },
   sectionHeaderText: { fontSize: 14, fontWeight: 'bold', color: '#334155' },
   sectionCountText: { fontSize: 13, color: '#64748B', fontWeight: '600' },
