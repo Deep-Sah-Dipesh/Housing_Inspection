@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, ScrollView, TouchableWithoutFeedback } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useFocusEffect, useRouter } from 'expo-router';
@@ -11,7 +11,7 @@ import * as IntentLauncher from 'expo-intent-launcher';
 import { generateZipArchive } from '../../utils/fileHelpers';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-interface BeneficiaryItem {
+export interface BeneficiaryItem {
   code: string;
   name: string;
   district_name: string;
@@ -20,6 +20,8 @@ interface BeneficiaryItem {
   sync_status: string;
   inspection_status: string;
   last_updated: string;
+  is_legacy?: boolean;
+  exact_path?: string;
 }
 
 const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Recently Inspected'] as const;
@@ -51,7 +53,10 @@ export default function DashboardScreen() {
   const [dashDistrict, setDashDistrict] = useState<string | null>(null);
   const [dashCity, setDashCity] = useState<string | null>(null);
   
-  const [groupedData, setGroupedData] = useState<{title: string, dateObj: Date, data: BeneficiaryItem[]}[]>([]);
+  const [rawGroupedData, setRawGroupedData] = useState<{title: string, dateObj: Date, data: BeneficiaryItem[]}[]>([]);
+  const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set());
+  const hasAutoExpanded = useRef(false);
+
   const [isLoading, setIsLoading] = useState(true);
   const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
   
@@ -74,6 +79,11 @@ export default function DashboardScreen() {
 
   const [showCityPrompt, setShowCityPrompt] = useState(false);
   const [fallbackCity, setFallbackCity] = useState('');
+
+  const [tapCount, setTapCount] = useState(0);
+  const [isAdvancedMode, setIsAdvancedMode] = useState(false);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [advancedPin, setAdvancedPin] = useState('');
 
   const loadFilterOptions = useCallback(async () => {
     try {
@@ -120,26 +130,97 @@ export default function DashboardScreen() {
       else query += ` ORDER BY last_updated DESC`;
 
       const results = await db.getAllAsync<BeneficiaryItem>(query, params);
+      let combinedResults = [...results];
 
-      const groups = results.reduce((acc: any, current) => {
+      if (isAdvancedMode) {
+         const rootUri = FileSystem.documentDirectory;
+         if (rootUri) {
+           const existingCodes = new Set(results.map(r => r.code));
+           const excludeList = ['SQLite', 'RCTAsyncLocalStorage', 'fonts', 'assets', 'projects_cache', '.expo'];
+
+           const scanLegacyFolder = async (dirUri: string): Promise<{count: number, latest: number}> => {
+             let count = 0; let latest = 0;
+             try {
+               const files = await FileSystem.readDirectoryAsync(dirUri);
+               for (const file of files) {
+                 const fileUri = `${dirUri}${file}`;
+                 const info = await FileSystem.getInfoAsync(fileUri);
+                 if (info.isDirectory) {
+                   const sub = await scanLegacyFolder(`${fileUri}/`);
+                   count += sub.count;
+                   if (sub.latest > latest) latest = sub.latest;
+                 } else if (file.toLowerCase().match(/\.(jpg|jpeg|png)$/)) {
+                   count++;
+                   if (info.modificationTime && info.modificationTime > latest) latest = info.modificationTime;
+                 }
+               }
+             } catch (e) {}
+             return {count, latest};
+           };
+
+           const items = await FileSystem.readDirectoryAsync(rootUri).catch(() => []);
+           for (const item of items) {
+             if (item.startsWith('.') || excludeList.includes(item) || existingCodes.has(item)) continue;
+             
+             const itemPath = `${rootUri}${item}/`;
+             const info = await FileSystem.getInfoAsync(itemPath).catch(() => null);
+             
+             if (info && info.isDirectory) {
+               const { count, latest } = await scanLegacyFolder(itemPath);
+               if (count > 0) {
+                  combinedResults.push({
+                     code: item,
+                     name: `Manual: ${item}`,
+                     district_name: 'Legacy Entry',
+                     city_name: '', 
+                     photo_count: count,
+                     sync_status: 'offline',
+                     inspection_status: 'legacy',
+                     last_updated: latest > 0 ? new Date(latest * 1000).toISOString() : new Date().toISOString(),
+                     is_legacy: true,
+                     exact_path: itemPath
+                  });
+               }
+             }
+           }
+         }
+      }
+
+      if (sortMode === 'Recently Inspected') {
+        combinedResults.sort((a, b) => new Date(b.last_updated).getTime() - new Date(a.last_updated).getTime());
+      } else if (sortMode === 'Name A-Z') {
+        combinedResults.sort((a, b) => a.name.localeCompare(b.name));
+      } else {
+        combinedResults.sort((a, b) => b.name.localeCompare(a.name));
+      }
+
+      const groups = combinedResults.reduce((acc: any, current) => {
         const dateObj = new Date(current.last_updated);
-        const dateStr = !isNaN(dateObj.getTime()) 
-          ? dateObj.toLocaleDateString('en-GB', { weekday: 'long', day: '2-digit', month: 'short', year: 'numeric' }) 
+        const dateStr = !isNaN(dateObj.getTime())
+          ? dateObj.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' }) 
           : 'Unknown Date';
 
-        if (!acc[dateStr]) acc[dateStr] = { title: dateStr, dateObj, data: [] };
+        if (!acc[dateStr]) acc[dateStr] = { title: dateStr, dateObj: dateObj, data: [] };
         acc[dateStr].data.push(current);
         return acc;
       }, {});
 
       const formattedSections = Object.values(groups).sort((a: any, b: any) => b.dateObj.getTime() - a.dateObj.getTime()) as {title: string, dateObj: Date, data: BeneficiaryItem[]}[];
-      setGroupedData(formattedSections);
+      
+      setRawGroupedData(formattedSections);
+
+      // Expand the most recent section automatically on initial load
+      if (!hasAutoExpanded.current && formattedSections.length > 0) {
+        setExpandedDates(new Set([formattedSections[0].title]));
+        hasAutoExpanded.current = true;
+      }
+
     } catch (error) {
       console.error("Failed to load dashboard data", error);
     } finally {
       setIsLoading(false);
     }
-  }, [db, searchQuery, dashDistrict, dashCity, sortMode]);
+  }, [db, searchQuery, dashDistrict, dashCity, sortMode, isAdvancedMode]);
 
   useFocusEffect(
     useCallback(() => {
@@ -148,20 +229,66 @@ export default function DashboardScreen() {
     }, [loadFilterOptions, loadGroupedBeneficiaries])
   );
 
+  const handleTitleTap = () => {
+    setTapCount(prev => {
+      if (prev + 1 >= 5) {
+        if (isAdvancedMode) {
+          setIsAdvancedMode(false);
+          Alert.alert("Normal Mode", "Returned to standard database view.");
+          return 0;
+        } else {
+          setShowPinModal(true);
+          return 0;
+        }
+      }
+      return prev + 1;
+    });
+  };
+
+  const handlePinSubmit = () => {
+    if (advancedPin === '1234') { 
+      setIsAdvancedMode(true);
+      setShowPinModal(false);
+      setAdvancedPin('');
+      Alert.alert("Advanced Mode Active", "Deep legacy filesystem scan activated for manual project folders.");
+    } else {
+      Alert.alert("Denied", "Incorrect PIN.");
+      setShowPinModal(false);
+      setAdvancedPin('');
+    }
+  };
+
+  const toggleSectionExpansion = (dateStr: string) => {
+    setExpandedDates(prev => {
+      const next = new Set(prev);
+      if (next.has(dateStr)) next.delete(dateStr);
+      else next.add(dateStr);
+      return next;
+    });
+  };
+
   const toggleSelection = (code: string) => setSelectedCodes(prev => prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code]);
 
   const toggleSection = (sectionData: BeneficiaryItem[]) => {
+    if (sectionData.length === 0) return;
     const sectionCodes = sectionData.map(item => item.code);
     const allSelected = sectionCodes.every(code => selectedCodes.includes(code));
     if (allSelected) setSelectedCodes(prev => prev.filter(c => !sectionCodes.includes(c)));
     else setSelectedCodes(prev => Array.from(new Set([...prev, ...sectionCodes])));
   };
 
+  const getSelectedItems = () => {
+    return rawGroupedData.flatMap(g => g.data).filter(item => selectedCodes.includes(item.code));
+  };
+
   const handleZipTrigger = async () => {
-    if (selectedCodes.length === 0) return;
-    const placeholders = selectedCodes.map(() => '?').join(',');
-    const rows = await db.getAllAsync<{city_name: string}>(`SELECT city_name FROM beneficiaries WHERE code IN (${placeholders})`, selectedCodes);
-    if (rows.some(r => !r.city_name || r.city_name.trim() === '')) {
+    const selectedItems = getSelectedItems();
+    if (selectedItems.length === 0) return;
+    
+    // Check if any standard database item is missing a city
+    const needsCity = selectedItems.some(r => !r.is_legacy && (!r.city_name || r.city_name.trim() === ''));
+    
+    if (needsCity) {
       setFallbackCity(''); 
       setShowCityPrompt(true);
     } else {
@@ -176,7 +303,8 @@ export default function DashboardScreen() {
     cancelRef.current.current = false;
 
     try {
-      const zipUri = await generateZipArchive(db, selectedCodes, fallbackCityStr, (msg, pct) => {
+      const selectedItems = getSelectedItems();
+      const zipUri = await generateZipArchive(db, selectedItems, fallbackCityStr, (msg, pct) => {
         setProgressMsg(msg);
         setProgressPercent(pct);
       }, cancelRef.current);
@@ -186,19 +314,26 @@ export default function DashboardScreen() {
       if (zipUri) {
         Alert.alert("ZIP Created", "Your file is ready. What would you like to do?", [
           { text: "Save to Device", onPress: async () => {
-              const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
-              if (permissions.granted) {
-                const filename = zipUri.split('/').pop() || 'Export.zip';
-                const destUri = await FileSystem.StorageAccessFramework.createFileAsync(permissions.directoryUri, filename, 'application/zip');
-                const base64Data = await FileSystem.readAsStringAsync(zipUri, { encoding: FileSystem.EncodingType.Base64 });
-                await FileSystem.writeAsStringAsync(destUri, base64Data, { encoding: FileSystem.EncodingType.Base64 });
-                Alert.alert("Success", "ZIP saved to your selected folder.");
+              try {
+                  const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+                  if (permissions.granted) {
+                    const filename = zipUri.split('/').pop() || 'Export.zip';
+                    const destUri = await FileSystem.StorageAccessFramework.createFileAsync(permissions.directoryUri, filename, 'application/zip');
+                    const base64Data = await FileSystem.readAsStringAsync(zipUri, { encoding: FileSystem.EncodingType.Base64 });
+                    await FileSystem.writeAsStringAsync(destUri, base64Data, { encoding: FileSystem.EncodingType.Base64 });
+                    Alert.alert("Success", "ZIP saved to your selected folder.");
+                    setSelectedCodes([]); 
+                  }
+              } catch (e: any) {
+                  Alert.alert("Save Error", "Direct saving was blocked by the OS due to memory size limits. Please use the Share option to save locally.");
               }
           }},
-          { text: "Share", onPress: () => Sharing.shareAsync(zipUri) },
+          { text: "Share", onPress: () => {
+              Sharing.shareAsync(zipUri);
+              setSelectedCodes([]);
+          }},
           { text: "Cancel", style: "cancel" }
         ]);
-        setSelectedCodes([]); 
       }
     } catch (e: any) {
       setIsProcessing(false);
@@ -211,68 +346,72 @@ export default function DashboardScreen() {
     setIsProcessing(true);
     setProgressPercent(0);
     cancelRef.current.current = false;
-    setProgressMsg("Analyzing location data...");
+    setProgressMsg("Gathering layout parameters...");
 
     try {
-      const placeholders = selectedCodes.map(() => '?').join(',');
-      
-      const countResult = await db.getFirstAsync<{total: number}>(`
-        SELECT COUNT(p.id) as total FROM beneficiaries b 
-        INNER JOIN photos p ON p.beneficiary_code = b.code 
-        WHERE b.code IN (${placeholders})
-      `, selectedCodes);
-      const totalExpectedPhotos = countResult?.total || 1;
-
-      const query = `
-        SELECT b.code, b.name, COALESCE(NULLIF(b.city_name, ''), 'Unknown_City') as assigned_city, MIN(p.created_at) as earliest_photo
-        FROM beneficiaries b
-        INNER JOIN photos p ON p.beneficiary_code = b.code
-        WHERE b.code IN (${placeholders})
-        GROUP BY b.code
-        ORDER BY assigned_city ASC, earliest_photo ASC
-      `;
-
-      const beneficiaries = await db.getAllAsync<any>(query, selectedCodes);
-      
+      const selectedItems = getSelectedItems();
       const groupedByCity: Record<string, any[]> = {};
-      for (const b of beneficiaries) {
-        if (!groupedByCity[b.assigned_city]) groupedByCity[b.assigned_city] = [];
-        groupedByCity[b.assigned_city].push(b);
+      
+      for (const item of selectedItems) {
+        const city = item.is_legacy ? 'Manual_Projects' : (item.city_name || 'Unknown_City');
+        if (!groupedByCity[city]) groupedByCity[city] = [];
+        groupedByCity[city].push(item);
       }
 
       let pdfFilenameParts = [];
       let allCitiesData = [];
+      let totalExpectedPhotos = selectedItems.reduce((acc, curr) => acc + curr.photo_count, 0);
       let totalPhotosGlobal = 0;
 
       for (const city of Object.keys(groupedByCity)) {
         const cityBeneficiaries = groupedByCity[city];
         let cityPhotos = [];
+        let citySerialNo = 1;
         
         for (let i = 0; i < cityBeneficiaries.length; i++) {
           const b = cityBeneficiaries[i];
-          const srNo = i + 1;
-          const photos = await db.getAllAsync<any>(`SELECT * FROM photos WHERE beneficiary_code = ? ORDER BY created_at ASC`, [b.code]);
+          let photoUris: string[] = [];
 
-          for (let j = 0; j < photos.length; j++) {
+          if (b.is_legacy && b.exact_path) {
+              const findPhotosRecursively = async (dir: string) => {
+                  let found: string[] = [];
+                  const files = await FileSystem.readDirectoryAsync(dir);
+                  for (const f of files) {
+                      const fullPath = `${dir}${f}`;
+                      const info = await FileSystem.getInfoAsync(fullPath);
+                      if (info.isDirectory) found.push(...await findPhotosRecursively(`${fullPath}/`));
+                      else if (f.toLowerCase().match(/\.(jpg|jpeg|png)$/)) found.push(fullPath);
+                  }
+                  return found;
+              };
+              photoUris = await findPhotosRecursively(b.exact_path);
+          } else {
+              const photos = await db.getAllAsync<any>(`SELECT local_uri FROM photos WHERE beneficiary_code = ? ORDER BY created_at ASC`, [b.code]);
+              photoUris = photos.map(p => p.local_uri);
+          }
+
+          for (let j = 0; j < photoUris.length; j++) {
             if (cancelRef.current.current) throw new Error("Cancelled by user");
-            const photo = photos[j];
+            const uri = photoUris[j];
             
-            setProgressPercent(Math.round(((totalPhotosGlobal + 1) / totalExpectedPhotos) * 100));
-            setProgressMsg(`Compressing image ${totalPhotosGlobal + 1} of ${totalExpectedPhotos}...`);
+            totalPhotosGlobal++;
+            setProgressPercent(Math.round((totalPhotosGlobal / totalExpectedPhotos) * 100));
+            setProgressMsg(`Formatting image ${totalPhotosGlobal} of${totalExpectedPhotos}...`);
             
             const manipResult = await ImageManipulator.manipulateAsync(
-              photo.local_uri, [{ resize: { width: 800 } }], { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+              uri, [{ resize: { width: 800 } }], { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
             );
 
-            const suffix = j === 0 ? '' : `_${j + 1}`;
-            const caption = `${srNo}. ${b.name || ""}<br/>${b.code || ""}${suffix}`.trim();
+            const suffix = photoUris.length > 1 ? `_${j + 1}` : ``;
+            const caption = `${citySerialNo}. ${b.name || ""}<br/>${b.code || ""}${suffix}`.trim();
             cityPhotos.push({ caption, base64: manipResult.base64 });
-            totalPhotosGlobal++;
           }
+          citySerialNo++;
         }
+        
         if (cityPhotos.length > 0) {
           const safeName = city.replace(/[^a-zA-Z0-9]/g, '');
-          pdfFilenameParts.push(`${safeName} - ${cityPhotos.length}`);
+          pdfFilenameParts.push(`${safeName}-${cityPhotos.length}`);
           allCitiesData.push({ city, photos: cityPhotos });
         }
       }
@@ -367,12 +506,8 @@ export default function DashboardScreen() {
             {activeDropdown === 'district' && ['All Districts', ...uniqueDistricts].map((opt) => {
               const isSelected = dashDistrict === opt || (!dashDistrict && opt === 'All Districts');
               return (
-                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { 
-                  setDashDistrict(opt === 'All Districts' ? null : opt); 
-                  setDashCity(null); 
-                  setActiveDropdown(null); 
-                }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Districts' ? 'All Districts' : toTitleCase(opt)}</Text>
+                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashDistrict(opt === 'All Districts' ? null : opt); setActiveDropdown(null); }}>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -380,7 +515,7 @@ export default function DashboardScreen() {
               const isSelected = dashCity === opt || (!dashCity && opt === 'All Cities');
               return (
                 <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashCity(opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{opt === 'All Cities' ? 'All Cities' : toTitleCase(opt)}</Text>
+                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
                 </TouchableOpacity>
               );
             })}
@@ -393,11 +528,23 @@ export default function DashboardScreen() {
     </Modal>
   );
 
+  const renderedSections = rawGroupedData.map(sec => ({
+    title: sec.title,
+    dateObj: sec.dateObj,
+    originalData: sec.data,
+    data: expandedDates.has(sec.title) ? sec.data : []
+  }));
+
   return (
     <View style={styles.container}>
       <View style={[styles.header, { paddingTop: insets.top + 10 }]}>
         <View style={styles.headerTop}>
-          <Text style={styles.title}>Export Workspace</Text>
+          <TouchableWithoutFeedback onPress={handleTitleTap}>
+            <View style={{flexDirection: 'row', alignItems: 'center'}}>
+              <Text style={styles.title}>Export Workspace</Text>
+              {isAdvancedMode && <View style={styles.advancedBadge}><Text style={styles.advancedBadgeText}>ADVANCED</Text></View>}
+            </View>
+          </TouchableWithoutFeedback>
         </View>
 
         <View style={styles.searchContainer}>
@@ -413,12 +560,12 @@ export default function DashboardScreen() {
         <View style={styles.filterWrapper}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }} contentContainerStyle={styles.filterScrollContent}>
             <TouchableOpacity style={[styles.filterBtn, dashDistrict && styles.filterBtnActive]} onPress={() => setActiveDropdown('district')}>
-              <Text style={[styles.filterBtnText, dashDistrict && styles.filterBtnTextActive]} numberOfLines={1}>{dashDistrict ? toTitleCase(dashDistrict) : 'District'}</Text>
+              <Text style={[styles.filterBtnText, dashDistrict && styles.filterBtnTextActive]} numberOfLines={1}>{getFirstWord(dashDistrict) || 'District'}</Text>
               <Ionicons name="chevron-down" size={14} color={dashDistrict ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
             
             <TouchableOpacity style={[styles.filterBtn, dashCity && styles.filterBtnActive]} onPress={() => setActiveDropdown('city')}>
-              <Text style={[styles.filterBtnText, dashCity && styles.filterBtnTextActive]} numberOfLines={1}>{dashCity ? getFirstWord(toTitleCase(dashCity)) : 'City'}</Text>
+              <Text style={[styles.filterBtnText, dashCity && styles.filterBtnTextActive]} numberOfLines={1}>{getFirstWord(dashCity) || 'City'}</Text>
               <Ionicons name="chevron-down" size={14} color={dashCity ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
             
@@ -442,47 +589,59 @@ export default function DashboardScreen() {
         <ActivityIndicator size="large" color="#2563EB" style={{ marginTop: 50 }} />
       ) : (
         <SectionList
-          sections={groupedData}
+          sections={renderedSections}
           keyExtractor={(item) => item.code}
+          stickySectionHeadersEnabled={true}
           contentContainerStyle={{ paddingBottom: 120, paddingTop: 10 }} 
-          renderSectionHeader={({ section: { title, data } }) => {
-            const isAllSelected = data.every(item => selectedCodes.includes(item.code));
+          renderSectionHeader={({ section: { title, originalData } }) => {
+            const isAllSelected = originalData.length > 0 && originalData.every(item => selectedCodes.includes(item.code));
+            const isExpanded = expandedDates.has(title);
+            
             return (
               <View style={styles.sectionHeader}>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <TouchableOpacity style={[styles.checkbox, isAllSelected && styles.checkboxSelected, { width: 22, height: 22, marginRight: 10 }]} onPress={() => toggleSection(data)}>
+                  <TouchableOpacity style={[styles.checkbox, isAllSelected && styles.checkboxSelected, { width: 22, height: 22, marginRight: 10 }]} onPress={() => toggleSection(originalData)}>
                     {isAllSelected && <Ionicons name="checkmark" size={14} color="#FFF" />}
                   </TouchableOpacity>
                   <Text style={styles.sectionHeaderText}>{title}</Text>
                 </View>
-                <Text style={styles.sectionCountText}>{data.length} Projects</Text>
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', padding: 5 }} onPress={() => toggleSectionExpansion(title)}>
+                  <Text style={styles.sectionCountText}>{originalData.length} Projects</Text>
+                  <Ionicons name={isExpanded ? 'chevron-up' : 'chevron-down'} size={16} color="#64748B" style={{ marginLeft: 6 }} />
+                </TouchableOpacity>
               </View>
             );
           }}
           renderItem={({ item }) => {
             const isSelected = selectedCodes.includes(item.code);
             return (
-              <View style={[styles.itemCard, styles.cardWithPhotos, isSelected && styles.itemCardSelected]}>
+              <View style={[styles.itemCard, styles.cardWithPhotos, isSelected && styles.itemCardSelected, item.is_legacy && styles.legacyItemCard]}>
                 <TouchableOpacity style={[styles.checkbox, isSelected && styles.checkboxSelected]} onPress={() => toggleSelection(item.code)} hitSlop={{top: 15, bottom: 15, left: 10, right: 15}}>
                   {isSelected && <Ionicons name="checkmark" size={16} color="#FFF" />}
                 </TouchableOpacity>
-                <TouchableOpacity style={{ flex: 1 }} onPress={() => { if (selectedCodes.length > 0) toggleSelection(item.code); else router.push(`/beneficiary/${encodeURIComponent(item.code)}`); }} onLongPress={() => toggleSelection(item.code)}>
+                
+                <TouchableOpacity style={{ flex: 1 }} onPress={() => { 
+                    if (selectedCodes.length > 0) toggleSelection(item.code); 
+                    else if (!item.is_legacy) router.push(`/beneficiary/${encodeURIComponent(item.code)}`); 
+                  }} 
+                  onLongPress={() => toggleSelection(item.code)}>
                   <View style={styles.cardHeaderInfo}>
+                    {item.is_legacy && <Ionicons name="folder-open" size={18} color="#F59E0B" style={{marginRight: 6}} />}
                     <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
                   </View>
                   <View style={styles.cardSubRow}>
                     <Text style={styles.itemCode}>ID: {item.code}</Text>
                     
                     <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                      <View style={styles.photoCountBadge}>
-                        <Text style={styles.photoCountText}>{item.photo_count}</Text>
-                        <Ionicons name="images" size={12} color="#10B981" style={{ marginLeft: 4 }} />
+                      <View style={[styles.photoCountBadge, item.is_legacy && {backgroundColor: '#FEF3C7'}]}>
+                        <Text style={[styles.photoCountText, item.is_legacy && {color: '#B45309'}]}>{item.photo_count}</Text>
+                        <Ionicons name="images" size={12} color={item.is_legacy ? "#D97706" : "#10B981"} style={{ marginLeft: 4 }} />
                       </View>
-                      {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
+                      {item.sync_status === 'pending' || item.is_legacy ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
                     </View>
                   </View>
                   <View style={styles.cardFooter}>
-                    <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {toTitleCase(item.city_name) || 'N/A'}, {toTitleCase(item.district_name) || 'N/A'}</Text>
+                    <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {item.is_legacy ? 'Device Directory' : (toTitleCase(item.city_name) || 'N/A')}</Text>
                   </View>
                 </TouchableOpacity>
               </View>
@@ -522,7 +681,7 @@ export default function DashboardScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Missing City Names</Text>
-            <Text style={{ fontSize: 14, color: '#64748B', marginBottom: 20, lineHeight: 20 }}>Please provide a fallback city name for proper grouping.</Text>
+            <Text style={{ fontSize: 14, color: '#64748B', marginBottom: 20, lineHeight: 20 }}>Please provide a fallback city name so we can properly group these legacy/missing projects.</Text>
             <TextInput style={[styles.numInput, { width: '100%', textAlign: 'left', paddingHorizontal: 15, marginBottom: 20 }]} placeholder="e.g., Tharad" value={fallbackCity} onChangeText={setFallbackCity} />
             <View style={styles.settingsActions}>
                <TouchableOpacity style={styles.settingsCancelBtn} onPress={()=>setShowCityPrompt(false)}><Text style={styles.settingsCancelText}>Cancel</Text></TouchableOpacity>
@@ -540,6 +699,19 @@ export default function DashboardScreen() {
             <Text style={styles.progressPercentText}>{progressPercent}%</Text>
             <Text style={styles.progressText}>{progressMsg}</Text>
             <TouchableOpacity style={styles.stopBtn} onPress={() => { cancelRef.current.current = true; setIsProcessing(false); }}><Text style={styles.stopBtnText}>Cancel</Text></TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showPinModal} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Admin Access</Text>
+            <TextInput style={[styles.numInput, { width: '100%', textAlign: 'left', paddingHorizontal: 15, marginBottom: 20 }]} secureTextEntry placeholder="Enter PIN" value={advancedPin} onChangeText={setAdvancedPin} keyboardType="number-pad" autoFocus />
+            <View style={styles.settingsActions}>
+               <TouchableOpacity style={styles.settingsCancelBtn} onPress={() => { setShowPinModal(false); setTapCount(0); }}><Text style={styles.settingsCancelText}>Cancel</Text></TouchableOpacity>
+               <TouchableOpacity style={[styles.settingsGenerateBtn, {backgroundColor: '#EF4444'}]} onPress={handlePinSubmit}><Text style={styles.settingsGenerateText}>Unlock</Text></TouchableOpacity>
+            </View>
           </View>
         </View>
       </Modal>
@@ -577,9 +749,11 @@ export default function DashboardScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F8FAFC' },
-  header: { padding: 20, paddingTop: 45, backgroundColor: '#FFF', borderBottomWidth: 1, borderColor: '#E2E8F0' },
+  header: { padding: 20, paddingTop: 45, backgroundColor: '#FFF', borderBottomWidth: 1, borderColor: '#E2E8F0', zIndex: 10 },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
   title: { fontSize: 24, fontWeight: 'bold', color: '#1E293B' },
+  advancedBadge: { backgroundColor: '#EF4444', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, marginLeft: 10 },
+  advancedBadgeText: { color: '#FFF', fontSize: 10, fontWeight: 'bold' },
   searchContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 15, paddingVertical: 10, marginBottom: 10 },
   searchInput: { flex: 1, marginLeft: 10, marginRight: 5, fontSize: 16, color: '#1E293B' },
   
@@ -597,9 +771,10 @@ const styles = StyleSheet.create({
   itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 15, marginHorizontal: 15, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0' },
   cardWithPhotos: { borderColor: '#10B981', backgroundColor: '#F0FDF4' },
   itemCardSelected: { borderColor: '#2563EB', backgroundColor: '#EFF6FF', borderWidth: 2 },
+  legacyItemCard: { borderColor: '#F59E0B', backgroundColor: '#FFFBEB' },
   checkbox: { width: 24, height: 24, borderRadius: 6, borderWidth: 2, borderColor: '#CBD5E1', marginRight: 15, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFF' },
   checkboxSelected: { backgroundColor: '#2563EB', borderColor: '#2563EB' },
-  cardHeaderInfo: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
+  cardHeaderInfo: { flexDirection: 'row', alignItems: 'center', flex: 1 },
   itemTitle: { fontSize: 17, fontWeight: '700', color: '#1E293B', flex: 1, marginRight: 10 },
   cardSubRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 },
   itemCode: { fontSize: 13, color: '#64748B', fontWeight: '500' },
@@ -614,11 +789,8 @@ const styles = StyleSheet.create({
   toolbarActions: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   exportBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10 },
   exportBtnText: { color: '#FFF', fontWeight: 'bold', fontSize: 14 },
-  selectAllBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#EFF6FF', borderRadius: 8 },
-  selectAllText: { color: '#2563EB', fontWeight: 'bold', fontSize: 13 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20 },
   progressCard: { backgroundColor: '#FFF', padding: 30, borderRadius: 16, width: '85%', alignItems: 'center' },
-  progressTitle: { fontSize: 18, fontWeight: 'bold', color: '#1E293B', marginBottom: 15 },
   progressBarBg: { width: '100%', height: 12, backgroundColor: '#E2E8F0', borderRadius: 6, overflow: 'hidden', marginBottom: 10 },
   progressBarFill: { height: '100%', backgroundColor: '#10B981' },
   progressPercentText: { fontSize: 16, fontWeight: 'bold', color: '#10B981', marginBottom: 5 },
