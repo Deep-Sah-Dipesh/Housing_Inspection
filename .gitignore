@@ -49,3 +49,9 @@ credentials.json
 
 #dataset files
 *.xlsx
+*.xls
+*.csv
+*.db
+*.sqlite
+assets/beneficiaries_seed.json
+databases_and_scripts/processed/

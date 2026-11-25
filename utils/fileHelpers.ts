@@ -1,4 +1,4 @@
-import * as FileSystem from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import * as SQLite from 'expo-sqlite';
 import * as XLSX from 'xlsx';
 import { zip } from 'react-native-zip-archive';
@@ -11,7 +11,7 @@ export const generatePhotoFilename = (
 ): string => {
   const cleanSr = srNo ? String(srNo).trim() : '00';
   const cleanName = beneficiaryName ? String(beneficiaryName).trim().replace(/[^a-zA-Z0-9 ]/g, '') : 'UNKNOWN';
-  const cleanCode = beneficiaryCode ? String(beneficiaryCode).trim() : 'NO_CODE';
+  const cleanCode = beneficiaryCode ? String(beneficiaryCode).trim().replace(/[\\/:*?"<>|]/g, '_') : 'NO_CODE';
   
   // First photo has no suffix. Second photo becomes _2, third becomes _3, etc.
   const suffix = currentPhotoIndex === 0 ? '' : `_${currentPhotoIndex + 1}`;
@@ -19,17 +19,17 @@ export const generatePhotoFilename = (
 };
 
 // Deep copy helper for legacy directories
-const recursiveCopy = async (src: string, dest: string) => {
-  await FileSystem.makeDirectoryAsync(dest, { intermediates: true });
-  const files = await FileSystem.readDirectoryAsync(src);
-  for (const f of files) {
-    const srcPath = `${src}${f}`;
-    const destPath = `${dest}${f}`;
-    const info = await FileSystem.getInfoAsync(srcPath);
-    if (info.isDirectory) {
-      await recursiveCopy(`${srcPath}/`, `${destPath}/`);
+const recursiveCopy = (srcDir: Directory, destDir: Directory) => {
+  destDir.create({ intermediates: true, idempotent: true });
+  for (const entry of srcDir.list()) {
+    if (entry instanceof Directory) {
+      recursiveCopy(entry, new Directory(destDir, entry.name));
     } else {
-      await FileSystem.copyAsync({ from: srcPath, to: destPath });
+      const targetFile = new File(destDir, entry.name);
+      if (targetFile.exists) {
+        targetFile.delete();
+      }
+      entry.copy(targetFile);
     }
   }
 };
@@ -44,12 +44,11 @@ export const generateZipArchive = async (
   try {
     if (!items || items.length === 0) return null;
 
-    const stagingDir = `${FileSystem.cacheDirectory}Staging_Export/`;
-    const stagingInfo = await FileSystem.getInfoAsync(stagingDir);
-    if (stagingInfo.exists) {
-      await FileSystem.deleteAsync(stagingDir, { idempotent: true });
+    const stagingDir = new Directory(Paths.cache, 'Staging_Export');
+    if (stagingDir.exists) {
+      stagingDir.delete();
     }
-    await FileSystem.makeDirectoryAsync(stagingDir, { intermediates: true });
+    stagingDir.create({ intermediates: true, idempotent: true });
 
     // Separate Standard DB Items and Legacy/Manual Items
     const dbItems = items.filter(i => !i.is_legacy);
@@ -87,8 +86,8 @@ export const generateZipArchive = async (
       for (const city of Object.keys(groupedByCity)) {
         if (cancelRef.current) throw new Error("Cancelled by user");
         const safeCityName = city.replace(/[^a-zA-Z0-9 _-]/g, '_').trim();
-        const cityDir = `${stagingDir}${safeCityName}/`;
-        await FileSystem.makeDirectoryAsync(cityDir, { intermediates: true });
+        const cityDir = new Directory(stagingDir, safeCityName);
+        cityDir.create({ intermediates: true, idempotent: true });
 
         const cityBeneficiaries = groupedByCity[city];
         const excelData = [];
@@ -105,8 +104,12 @@ export const generateZipArchive = async (
           let photoCount = 0;
           for (const photo of photos) {
             const photoFileName = generatePhotoFilename(srNo, b.name, b.code, photoCount);
-            const destPath = `${cityDir}${photoFileName}`;
-            await FileSystem.copyAsync({ from: photo.local_uri, to: destPath });
+            const sourcePhoto = new File(photo.local_uri);
+            const destPhoto = new File(cityDir, photoFileName);
+            if (destPhoto.exists) {
+              destPhoto.delete();
+            }
+            sourcePhoto.copy(destPhoto);
             photoCount++;
           }
 
@@ -138,8 +141,8 @@ export const generateZipArchive = async (
         const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
         
         const excelFileName = `${safeCityName}_Export.xlsx`;
-        const excelPath = `${cityDir}${excelFileName}`;
-        await FileSystem.writeAsStringAsync(excelPath, wbout, { encoding: FileSystem.EncodingType.Base64 });
+        const excelFile = new File(cityDir, excelFileName);
+        excelFile.write(wbout, { encoding: 'base64' });
       }
     }
 
@@ -151,10 +154,10 @@ export const generateZipArchive = async (
         
         // Use the exact folder name as it was
         const legDirName = leg.code.replace(/[^a-zA-Z0-9 _-]/g, '_').trim();
-        const destDir = `${stagingDir}${legDirName}/`;
+        const destDir = new Directory(stagingDir, legDirName);
 
         if (leg.exact_path) {
-          await recursiveCopy(leg.exact_path, destDir);
+          recursiveCopy(new Directory(leg.exact_path), destDir);
         }
 
         totalProcessed++;
@@ -166,15 +169,20 @@ export const generateZipArchive = async (
     onProgress("Compressing structured folders...", 80);
     const timestamp = new Date().toISOString().split('T')[0] + "_" + new Date().getHours() + new Date().getMinutes();
     const zipFileName = `Projects_Export_${timestamp}.zip`;
-    const targetZipPath = `${FileSystem.cacheDirectory}${zipFileName}`;
+    const targetZipFile = new File(Paths.cache, zipFileName);
+    if (targetZipFile.exists) {
+      targetZipFile.delete();
+    }
 
     if (cancelRef.current) throw new Error("Cancelled by user");
-    await zip(stagingDir, targetZipPath);
+    await zip(stagingDir.uri, targetZipFile.uri);
     if (cancelRef.current) throw new Error("Cancelled by user");
 
-    await FileSystem.deleteAsync(stagingDir, { idempotent: true });
+    if (stagingDir.exists) {
+      stagingDir.delete();
+    }
     
-    return targetZipPath;
+    return targetZipFile.uri;
 
   } catch (error: any) {
     if (error.message !== "Cancelled by user") {

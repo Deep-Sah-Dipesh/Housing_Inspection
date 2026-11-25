@@ -5,7 +5,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
-import * as FileSystem from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { generateZipArchive } from '../../utils/fileHelpers';
@@ -133,57 +133,58 @@ export default function DashboardScreen() {
       let combinedResults = [...results];
 
       if (isAdvancedMode) {
-         const rootUri = FileSystem.documentDirectory;
-         if (rootUri) {
-           const existingCodes = new Set(results.map(r => r.code));
-           const excludeList = ['SQLite', 'RCTAsyncLocalStorage', 'fonts', 'assets', 'projects_cache', '.expo'];
+        const rootDir = Paths.document;
+        if (rootDir.exists) {
+          const existingCodes = new Set(results.map(r => r.code));
+          const excludeList = ['SQLite', 'RCTAsyncLocalStorage', 'fonts', 'assets', 'projects_cache', '.expo'];
 
-           const scanLegacyFolder = async (dirUri: string): Promise<{count: number, latest: number}> => {
-             let count = 0; let latest = 0;
-             try {
-               const files = await FileSystem.readDirectoryAsync(dirUri);
-               for (const file of files) {
-                 const fileUri = `${dirUri}${file}`;
-                 const info = await FileSystem.getInfoAsync(fileUri);
-                 if (info.isDirectory) {
-                   const sub = await scanLegacyFolder(`${fileUri}/`);
-                   count += sub.count;
-                   if (sub.latest > latest) latest = sub.latest;
-                 } else if (file.toLowerCase().match(/\.(jpg|jpeg|png)$/)) {
-                   count++;
-                   if (info.modificationTime && info.modificationTime > latest) latest = info.modificationTime;
-                 }
-               }
-             } catch (e) {}
-             return {count, latest};
-           };
+          const scanLegacyFolder = (dir: Directory): { count: number; latest: number } => {
+            let count = 0;
+            let latest = 0;
+            try {
+              for (const entry of dir.list()) {
+                if (entry instanceof Directory) {
+                  const sub = scanLegacyFolder(entry);
+                  count += sub.count;
+                  if (sub.latest > latest) latest = sub.latest;
+                } else if (entry.name.toLowerCase().match(/\.(jpg|jpeg|png)$/)) {
+                  count++;
+                  const modTime = entry.modificationTime;
+                  if (modTime && modTime > latest) latest = modTime;
+                }
+              }
+            } catch (e) {}
+            return { count, latest };
+          };
 
-           const items = await FileSystem.readDirectoryAsync(rootUri).catch(() => []);
-           for (const item of items) {
-             if (item.startsWith('.') || excludeList.includes(item) || existingCodes.has(item)) continue;
-             
-             const itemPath = `${rootUri}${item}/`;
-             const info = await FileSystem.getInfoAsync(itemPath).catch(() => null);
-             
-             if (info && info.isDirectory) {
-               const { count, latest } = await scanLegacyFolder(itemPath);
-               if (count > 0) {
-                  combinedResults.push({
-                     code: item,
-                     name: `Manual: ${item}`,
-                     district_name: 'Legacy Entry',
-                     city_name: '', 
-                     photo_count: count,
-                     sync_status: 'offline',
-                     inspection_status: 'legacy',
-                     last_updated: latest > 0 ? new Date(latest * 1000).toISOString() : new Date().toISOString(),
-                     is_legacy: true,
-                     exact_path: itemPath
-                  });
-               }
-             }
-           }
-         }
+          let items: (Directory | File)[] = [];
+          try {
+            items = rootDir.list();
+          } catch (e) {
+            items = [];
+          }
+          for (const item of items) {
+            if (!(item instanceof Directory)) continue;
+            const itemName = item.name;
+            if (itemName.startsWith('.') || excludeList.includes(itemName) || existingCodes.has(itemName)) continue;
+
+            const { count, latest } = scanLegacyFolder(item);
+            if (count > 0) {
+              combinedResults.push({
+                code: itemName,
+                name: `Manual: ${itemName}`,
+                district_name: 'Legacy Entry',
+                city_name: '',
+                photo_count: count,
+                sync_status: 'offline',
+                inspection_status: 'legacy',
+                last_updated: latest > 0 ? new Date(latest).toISOString() : new Date().toISOString(),
+                is_legacy: true,
+                exact_path: item.uri
+              });
+            }
+          }
+        }
       }
 
       if (sortMode === 'Recently Inspected') {
@@ -315,16 +316,16 @@ export default function DashboardScreen() {
         Alert.alert("ZIP Created", "Your file is ready. What would you like to do?", [
           { text: "Save to Device", onPress: async () => {
               try {
-                  const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
-                  if (permissions.granted) {
-                    const filename = zipUri.split('/').pop() || 'Export.zip';
-                    const destUri = await FileSystem.StorageAccessFramework.createFileAsync(permissions.directoryUri, filename, 'application/zip');
-                    const base64Data = await FileSystem.readAsStringAsync(zipUri, { encoding: FileSystem.EncodingType.Base64 });
-                    await FileSystem.writeAsStringAsync(destUri, base64Data, { encoding: FileSystem.EncodingType.Base64 });
-                    Alert.alert("Success", "ZIP saved to your selected folder.");
-                    setSelectedCodes([]); 
-                  }
-              } catch (e: any) {
+                  const pickedDir = await Directory.pickDirectoryAsync();
+                  const zipFile = new File(zipUri);
+                  const destFile = pickedDir.createFile(zipFile.name || 'Export.zip', 'application/zip');
+                  const zipBytes = await zipFile.bytes();
+                  destFile.write(zipBytes);
+                  Alert.alert("Success", "ZIP saved to your selected folder.");
+                  setSelectedCodes([]);
+              } catch (e: unknown) {
+                  const msg = e instanceof Error ? e.message : '';
+                  if (msg.toLowerCase().includes('cancel')) return;
                   Alert.alert("Save Error", "Direct saving was blocked by the OS due to memory size limits. Please use the Share option to save locally.");
               }
           }},
@@ -373,18 +374,15 @@ export default function DashboardScreen() {
           let photoUris: string[] = [];
 
           if (b.is_legacy && b.exact_path) {
-              const findPhotosRecursively = async (dir: string) => {
-                  let found: string[] = [];
-                  const files = await FileSystem.readDirectoryAsync(dir);
-                  for (const f of files) {
-                      const fullPath = `${dir}${f}`;
-                      const info = await FileSystem.getInfoAsync(fullPath);
-                      if (info.isDirectory) found.push(...await findPhotosRecursively(`${fullPath}/`));
-                      else if (f.toLowerCase().match(/\.(jpg|jpeg|png)$/)) found.push(fullPath);
+              const findPhotosRecursively = (dir: Directory): string[] => {
+                  const found: string[] = [];
+                  for (const entry of dir.list()) {
+                      if (entry instanceof Directory) found.push(...findPhotosRecursively(entry));
+                      else if (entry.name.toLowerCase().match(/\.(jpg|jpeg|png)$/)) found.push(entry.uri);
                   }
                   return found;
               };
-              photoUris = await findPhotosRecursively(b.exact_path);
+              photoUris = findPhotosRecursively(new Directory(b.exact_path));
           } else {
               const photos = await db.getAllAsync<any>(`SELECT local_uri FROM photos WHERE beneficiary_code = ? ORDER BY created_at ASC`, [b.code]);
               photoUris = photos.map(p => p.local_uri);
@@ -467,15 +465,19 @@ export default function DashboardScreen() {
 
       const { uri } = await Print.printToFileAsync({ html });
       const pdfFilename = `${pdfFilenameParts.join('_')}.pdf`;
-      const customUri = `${FileSystem.cacheDirectory}${pdfFilename}`;
-      await FileSystem.moveAsync({ from: uri, to: customUri });
+      const customPdfFile = new File(Paths.cache, pdfFilename);
+      if (customPdfFile.exists) {
+        customPdfFile.delete();
+      }
+      new File(uri).move(customPdfFile);
+      const customUri = customPdfFile.uri;
 
       setIsProcessing(false);
       
       Alert.alert("Success", "PDF created successfully!", [
           { text: "View", onPress: async () => {
              try {
-                const cUri = await FileSystem.getContentUriAsync(customUri);
+                const cUri = customPdfFile.contentUri;
                 await IntentLauncher.startActivityAsync('android.intent.action.VIEW', { data: cUri, flags: 1, type: 'application/pdf' });
              } catch (e) { Alert.alert("Error", "No PDF Viewer installed on this device."); }
           }},

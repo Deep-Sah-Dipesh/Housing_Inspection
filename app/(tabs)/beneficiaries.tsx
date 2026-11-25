@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Modal, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
@@ -15,13 +15,15 @@ interface Beneficiary {
   inspection_status: string;
   sync_status: string;
   photo_count: number;
+  is_custom?: number;
 }
 
-const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Inspection Pending', 'Recently Inspected'] as const;
+const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Inspection Pending', 'Recently Inspected', 'Recently Added'] as const;
 type SortMode = typeof SORT_OPTIONS[number];
 
 const getShortSortName = (sort: SortMode) => {
   if (sort === 'Recently Inspected') return 'Recent';
+  if (sort === 'Recently Added') return 'Added';
   if (sort === 'Inspection Pending') return 'Pending';
   if (sort === 'Name A-Z') return 'A-Z';
   if (sort === 'Name Z-A') return 'Z-A';
@@ -50,6 +52,7 @@ export default function BeneficiariesScreen() {
   const [isLoading, setIsLoading] = useState(true);
 
   const [sortMode, setSortMode] = useState<SortMode>('Name A-Z');
+  const [pageLimit, setPageLimit] = useState(100);
   const [uniqueDistricts, setUniqueDistricts] = useState<string[]>([]);
   const [uniqueCities, setUniqueCities] = useState<string[]>([]);
   const [activeDropdown, setActiveDropdown] = useState<'district' | 'city' | 'sort' | null>(null);
@@ -59,12 +62,54 @@ export default function BeneficiariesScreen() {
     code: '', name: '', serial_number: '', father_name: '',
     district_name: '', city_name: '', project_name: '', site_address: ''
   });
+  const [addDistrictMode, setAddDistrictMode] = useState<'select' | 'custom'>('select');
+  const [addCityMode, setAddCityMode] = useState<'select' | 'custom'>('select');
+  const [addDropdown, setAddDropdown] = useState<'district' | 'city' | null>(null);
+  const [addAvailableCities, setAddAvailableCities] = useState<string[]>([]);
+
+  useEffect(() => {
+    setPageLimit(100);
+  }, [searchQuery, district, city, sortMode]);
+
+  useEffect(() => {
+    const selectedDistrict = newProject.district_name.trim();
+    if (!isAddModalVisible || !selectedDistrict) {
+      setAddAvailableCities([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await db.getAllAsync<{ city_name: string }>(
+          `SELECT DISTINCT city_name FROM beneficiaries WHERE LOWER(TRIM(district_name)) = LOWER(TRIM(?)) AND city_name IS NOT NULL AND TRIM(city_name) != '' ORDER BY city_name ASC`,
+          [selectedDistrict]
+        );
+        if (!cancelled) {
+          setAddAvailableCities(rows.map(r => r.city_name));
+        }
+      } catch (e) {
+        if (!cancelled) setAddAvailableCities([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [db, isAddModalVisible, newProject.district_name]);
+
+  const resetAddModal = () => {
+    setNewProject({
+      code: '', name: '', serial_number: '', father_name: '',
+      district_name: '', city_name: '', project_name: '', site_address: ''
+    });
+    setAddDistrictMode('select');
+    setAddCityMode('select');
+    setAddDropdown(null);
+    setAddAvailableCities([]);
+  };
 
   const loadFilterOptions = useCallback(async () => {
     try {
-      const dists = await db.getAllAsync<{district_name: string}>(`SELECT DISTINCT district_name FROM beneficiaries WHERE district_name IS NOT NULL AND district_name != '' ORDER BY district_name ASC`);
+      const dists = await db.getAllAsync<{district_name: string}>(`SELECT DISTINCT district_name FROM beneficiaries WHERE district_name IS NOT NULL AND TRIM(district_name) != '' ORDER BY district_name ASC`);
       setUniqueDistricts(dists.map(d => d.district_name));
-      let cityQuery = `SELECT DISTINCT city_name FROM beneficiaries WHERE city_name IS NOT NULL AND city_name != ''`;
+      let cityQuery = `SELECT DISTINCT city_name FROM beneficiaries WHERE city_name IS NOT NULL AND TRIM(city_name) != ''`;
       const cityParams: string[] = [];
       if (district) { cityQuery += ` AND district_name = ?`; cityParams.push(district); }
       cityQuery += ` ORDER BY city_name ASC`;
@@ -77,11 +122,11 @@ export default function BeneficiariesScreen() {
     setIsLoading(true);
     try {
       let query = `
-        SELECT b.code, b.name, b.district_name, b.city_name, b.project_name, b.inspection_status, b.sync_status,
+        SELECT b.code, b.name, b.district_name, b.city_name, b.project_name, b.inspection_status, b.sync_status, COALESCE(b.is_custom, 0) as is_custom,
         (SELECT COUNT(id) FROM photos WHERE beneficiary_code = b.code) as photo_count
         FROM beneficiaries b WHERE 1=1
       `;
-      const params: any[] = [];
+      const params: (string | number)[] = [];
       if (searchQuery) { query += ` AND (b.name LIKE ? OR b.code LIKE ?)`; params.push(`%${searchQuery}%`, `%${searchQuery}%`); }
       if (district) { query += ` AND b.district_name = ?`; params.push(district); }
       if (city) { query += ` AND b.city_name = ?`; params.push(city); }
@@ -89,13 +134,15 @@ export default function BeneficiariesScreen() {
       if (sortMode === 'Name A-Z') query += ` ORDER BY b.name ASC`;
       else if (sortMode === 'Name Z-A') query += ` ORDER BY b.name DESC`;
       else if (sortMode === 'Inspection Pending') query += ` ORDER BY CASE WHEN b.inspection_status = 'pending' THEN 0 ELSE 1 END, b.last_updated DESC`;
+      else if (sortMode === 'Recently Added') query += ` ORDER BY COALESCE(b.is_custom, 0) DESC, b.last_updated DESC, b.rowid DESC`;
       else query += ` ORDER BY CASE WHEN photo_count > 0 THEN 0 ELSE 1 END, b.last_updated DESC`;
       
-      query += ` LIMIT 100`;
+      query += ` LIMIT ?`;
+      params.push(pageLimit);
       const results = await db.getAllAsync<Beneficiary>(query, params);
       setData(results);
     } catch (error) {} finally { setIsLoading(false); }
-  }, [db, searchQuery, district, city, sortMode]);
+  }, [db, searchQuery, district, city, sortMode, pageLimit]);
 
   useFocusEffect(
     useCallback(() => {
@@ -105,16 +152,43 @@ export default function BeneficiariesScreen() {
   );
 
   const handleAddProject = async () => {
-    if (!newProject.code || !newProject.name) return Alert.alert("Missing Fields", "Application Number and Name are required.");
+    const cleanCode = newProject.code.trim();
+    const cleanName = newProject.name.trim();
+    if (!cleanCode || !cleanName) {
+      return Alert.alert("Missing Fields", "Application Number and Beneficiary Name are required.");
+    }
+
+    const cleanSerial = newProject.serial_number.trim();
+    const cleanFather = newProject.father_name.trim();
+    const cleanDistrict = newProject.district_name.trim();
+    const cleanCity = cleanDistrict ? newProject.city_name.trim() : '';
+    const cleanProjectName = newProject.project_name.trim();
+    const cleanSiteAddress = newProject.site_address.trim();
+
     try {
+      const existing = await db.getFirstAsync<{ code: string }>(`SELECT code FROM beneficiaries WHERE code = ?`, [cleanCode]);
+      if (existing) {
+        return Alert.alert("Duplicate Project", "A project with this Application Number already exists.");
+      }
+
       await db.runAsync(
-        `INSERT INTO beneficiaries (code, name, serial_number, father_name, district_name, city_name, project_name, site_address, inspection_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-        [newProject.code, newProject.name, newProject.serial_number, newProject.father_name, newProject.district_name, newProject.city_name, newProject.project_name, newProject.site_address]
+        `INSERT INTO beneficiaries (code, name, serial_number, father_name, district_name, city_name, project_name, site_address, inspection_status, sync_status, is_custom, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 1, CURRENT_TIMESTAMP)`,
+        [cleanCode, cleanName, cleanSerial, cleanFather, cleanDistrict, cleanCity, cleanProjectName, cleanSiteAddress]
       );
+
+      // Clear active filters if they would hide the newly added custom project
+      if ((district && district !== cleanDistrict) || (city && city !== cleanCity)) {
+        clearFilters();
+      }
+      setSearchQuery('');
+      setSortMode('Recently Added');
       setAddModalVisible(false);
-      setNewProject({ code: '', name: '', serial_number: '', father_name: '', district_name: '', city_name: '', project_name: '', site_address: '' });
-      loadBeneficiaries();
-    } catch (error: any) { Alert.alert("Database Error", "Project might already exist."); }
+      resetAddModal();
+      await loadFilterOptions();
+      await loadBeneficiaries();
+    } catch (error: unknown) {
+      Alert.alert("Database Error", "Could not save project. Please try again.");
+    }
   };
 
   const renderDropdownModal = () => (
@@ -205,12 +279,27 @@ export default function BeneficiariesScreen() {
           data={data}
           keyExtractor={(item) => item.code}
           contentContainerStyle={{ padding: 15, paddingBottom: 100 }}
+          onEndReached={() => {
+            if (!isLoading && data.length >= pageLimit) {
+              setPageLimit(prev => prev + 100);
+            }
+          }}
+          onEndReachedThreshold={0.4}
           renderItem={({ item }) => {
             const hasPhotos = item.photo_count > 0;
+            const locationLabel = [item.city_name, item.district_name]
+              .filter((v): v is string => Boolean(v && v.trim()))
+              .map(toTitleCase)
+              .join(', ') || 'No location specified';
             return (
-              <TouchableOpacity style={[styles.card, hasPhotos && styles.cardWithPhotos]} onPress={() => router.push(`/beneficiary/${item.code}`)}>
+              <TouchableOpacity style={[styles.card, hasPhotos && styles.cardWithPhotos]} onPress={() => router.push(`/beneficiary/${encodeURIComponent(item.code)}`)}>
                 <View style={styles.cardHeaderInfo}>
                   <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
+                  {item.is_custom === 1 && (
+                    <View style={styles.customBadge}>
+                      <Text style={styles.customBadgeText}>Custom</Text>
+                    </View>
+                  )}
                 </View>
                 <View style={styles.cardSubRow}>
                   <Text style={styles.itemCode}>ID: {item.code}</Text>
@@ -226,7 +315,7 @@ export default function BeneficiariesScreen() {
                   </View>
                 </View>
                 <View style={styles.cardFooter}>
-                  <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {toTitleCase(item.city_name) || 'N/A'}, {toTitleCase(item.district_name) || 'N/A'}</Text>
+                  <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {locationLabel}</Text>
                 </View>
               </TouchableOpacity>
             );
@@ -242,31 +331,170 @@ export default function BeneficiariesScreen() {
 
       {renderDropdownModal()}
 
-      <Modal visible={isAddModalVisible} animationType="slide" presentationStyle="pageSheet">
+      <Modal visible={isAddModalVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => { setAddModalVisible(false); resetAddModal(); }}>
         <View style={[styles.modalHeader, { paddingTop: insets.top + 15 }]}>
           <Text style={styles.modalTitle}>Add New Project</Text>
-          <TouchableOpacity onPress={() => setAddModalVisible(false)}><Ionicons name="close" size={28} color="#1E293B" /></TouchableOpacity>
+          <TouchableOpacity onPress={() => { setAddModalVisible(false); resetAddModal(); }}><Ionicons name="close" size={28} color="#1E293B" /></TouchableOpacity>
         </View>
-        <ScrollView contentContainerStyle={styles.formContainer}>
+        <ScrollView contentContainerStyle={styles.formContainer} keyboardShouldPersistTaps="handled">
           <Text style={styles.inputLabel}>Application Number (Code) *</Text>
-          <TextInput style={styles.input} value={newProject.code} onChangeText={(text) => setNewProject({...newProject, code: text})} />
+          <TextInput style={styles.input} placeholder="Enter application number" placeholderTextColor="#94A3B8" value={newProject.code} onChangeText={(text) => setNewProject({...newProject, code: text})} />
           <Text style={styles.inputLabel}>Beneficiary Name *</Text>
-          <TextInput style={styles.input} value={newProject.name} onChangeText={(text) => setNewProject({...newProject, name: text})} />
+          <TextInput style={styles.input} placeholder="Enter beneficiary name" placeholderTextColor="#94A3B8" value={newProject.name} onChangeText={(text) => setNewProject({...newProject, name: text})} />
           <Text style={styles.inputLabel}>Serial Number</Text>
-          <TextInput style={styles.input} value={newProject.serial_number} onChangeText={(text) => setNewProject({...newProject, serial_number: text})} keyboardType="numeric" />
+          <TextInput style={styles.input} placeholder="Optional" placeholderTextColor="#94A3B8" value={newProject.serial_number} onChangeText={(text) => setNewProject({...newProject, serial_number: text})} keyboardType="numeric" />
           <Text style={styles.inputLabel}>Father Name</Text>
-          <TextInput style={styles.input} value={newProject.father_name} onChangeText={(text) => setNewProject({...newProject, father_name: text})} />
+          <TextInput style={styles.input} placeholder="Optional" placeholderTextColor="#94A3B8" value={newProject.father_name} onChangeText={(text) => setNewProject({...newProject, father_name: text})} />
+
           <Text style={styles.inputLabel}>District Name</Text>
-          <TextInput style={styles.input} value={newProject.district_name} onChangeText={(text) => setNewProject({...newProject, district_name: text})} />
+          <View style={styles.selectRow}>
+            <TouchableOpacity style={styles.selectTrigger} onPress={() => setAddDropdown('district')}>
+              <Text style={[styles.selectTriggerText, !newProject.district_name && addDistrictMode !== 'custom' && styles.selectPlaceholder]}>
+                {addDistrictMode === 'custom'
+                  ? 'Custom District'
+                  : (newProject.district_name ? toTitleCase(newProject.district_name) : 'Select District (Optional)')}
+              </Text>
+              <Ionicons name="chevron-down" size={18} color="#64748B" />
+            </TouchableOpacity>
+            {(newProject.district_name.length > 0 || addDistrictMode === 'custom') && (
+              <TouchableOpacity
+                style={styles.clearSelectionBtn}
+                onPress={() => {
+                  setAddDistrictMode('select');
+                  setAddCityMode('select');
+                  setNewProject({ ...newProject, district_name: '', city_name: '' });
+                }}
+              >
+                <Ionicons name="close-circle" size={22} color="#94A3B8" />
+              </TouchableOpacity>
+            )}
+          </View>
+          {addDistrictMode === 'custom' && (
+            <TextInput
+              style={[styles.input, { marginTop: 8 }]}
+              placeholder="Type custom district name..."
+              placeholderTextColor="#94A3B8"
+              value={newProject.district_name}
+              onChangeText={(text) => setNewProject({ ...newProject, district_name: text, city_name: '' })}
+            />
+          )}
+
           <Text style={styles.inputLabel}>City Name</Text>
-          <TextInput style={styles.input} value={newProject.city_name} onChangeText={(text) => setNewProject({...newProject, city_name: text})} />
+          <View style={styles.selectRow}>
+            <TouchableOpacity
+              style={[styles.selectTrigger, !newProject.district_name.trim() && styles.selectTriggerDisabled]}
+              onPress={() => {
+                if (!newProject.district_name.trim()) {
+                  Alert.alert("Select District First", "Please select or enter a District before choosing a City.");
+                  return;
+                }
+                setAddDropdown('city');
+              }}
+            >
+              <Text style={[styles.selectTriggerText, (!newProject.district_name.trim() || (!newProject.city_name && addCityMode !== 'custom')) && styles.selectPlaceholder]}>
+                {!newProject.district_name.trim()
+                  ? 'Select a District first'
+                  : addCityMode === 'custom'
+                    ? 'Custom City'
+                    : (newProject.city_name ? toTitleCase(newProject.city_name) : 'Select City (Optional)')}
+              </Text>
+              <Ionicons name="chevron-down" size={18} color="#64748B" />
+            </TouchableOpacity>
+            {(newProject.city_name.length > 0 || addCityMode === 'custom') && (
+              <TouchableOpacity
+                style={styles.clearSelectionBtn}
+                onPress={() => {
+                  setAddCityMode('select');
+                  setNewProject({ ...newProject, city_name: '' });
+                }}
+              >
+                <Ionicons name="close-circle" size={22} color="#94A3B8" />
+              </TouchableOpacity>
+            )}
+          </View>
+          {addCityMode === 'custom' && newProject.district_name.trim().length > 0 && (
+            <TextInput
+              style={[styles.input, { marginTop: 8 }]}
+              placeholder="Type custom city name..."
+              placeholderTextColor="#94A3B8"
+              value={newProject.city_name}
+              onChangeText={(text) => setNewProject({ ...newProject, city_name: text })}
+            />
+          )}
+
           <Text style={styles.inputLabel}>Project Name</Text>
-          <TextInput style={styles.input} value={newProject.project_name} onChangeText={(text) => setNewProject({...newProject, project_name: text})} />
+          <TextInput style={styles.input} placeholder="Optional" placeholderTextColor="#94A3B8" value={newProject.project_name} onChangeText={(text) => setNewProject({...newProject, project_name: text})} />
           <Text style={styles.inputLabel}>Site Address</Text>
-          <TextInput style={styles.input} value={newProject.site_address} onChangeText={(text) => setNewProject({...newProject, site_address: text})} multiline />
+          <TextInput style={styles.input} placeholder="Optional" placeholderTextColor="#94A3B8" value={newProject.site_address} onChangeText={(text) => setNewProject({...newProject, site_address: text})} multiline />
 
           <TouchableOpacity style={styles.saveBtn} onPress={handleAddProject}><Text style={styles.saveBtnText}>Save Project</Text></TouchableOpacity>
         </ScrollView>
+
+        {addDropdown !== null && (
+          <TouchableOpacity style={styles.inModalOverlay} activeOpacity={1} onPress={() => setAddDropdown(null)}>
+            <View style={styles.dropdownCard} onStartShouldSetResponder={() => true}>
+              <Text style={styles.dropdownTitle}>
+                {addDropdown === 'district' ? 'Select District' : `Select City (${toTitleCase(newProject.district_name)})`}
+              </Text>
+              <ScrollView style={{ maxHeight: 320 }}>
+                <TouchableOpacity
+                  style={[styles.dropdownOption, styles.customDropdownOption]}
+                  onPress={() => {
+                    if (addDropdown === 'district') {
+                      setAddDistrictMode('custom');
+                      setAddCityMode('select');
+                      setNewProject({ ...newProject, district_name: '', city_name: '' });
+                    } else {
+                      setAddCityMode('custom');
+                      setNewProject({ ...newProject, city_name: '' });
+                    }
+                    setAddDropdown(null);
+                  }}
+                >
+                  <Text style={styles.customDropdownOptionText}>+ Custom (Enter Manually)</Text>
+                </TouchableOpacity>
+
+                {addDropdown === 'district' && uniqueDistricts.map((opt) => {
+                  const isSelected = addDistrictMode === 'select' && newProject.district_name === opt;
+                  return (
+                    <TouchableOpacity
+                      key={opt}
+                      style={styles.dropdownOption}
+                      onPress={() => {
+                        setAddDistrictMode('select');
+                        setAddCityMode('select');
+                        setNewProject({ ...newProject, district_name: opt, city_name: '' });
+                        setAddDropdown(null);
+                      }}
+                    >
+                      <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+
+                {addDropdown === 'city' && addAvailableCities.map((opt) => {
+                  const isSelected = addCityMode === 'select' && newProject.city_name === opt;
+                  return (
+                    <TouchableOpacity
+                      key={opt}
+                      style={styles.dropdownOption}
+                      onPress={() => {
+                        setAddCityMode('select');
+                        setNewProject({ ...newProject, city_name: opt });
+                        setAddDropdown(null);
+                      }}
+                    >
+                      <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+              <TouchableOpacity style={styles.dropdownCancelBtn} onPress={() => setAddDropdown(null)}>
+                <Text style={styles.dropdownCancelText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        )}
       </Modal>
     </View>
   );
@@ -316,5 +544,16 @@ const styles = StyleSheet.create({
   dropdownOptionText: { fontSize: 16, color: '#475569', textAlign: 'center', width: '100%' },
   dropdownOptionSelectedText: { color: '#2563EB', fontWeight: 'bold' },
   dropdownCancelBtn: { padding: 15, alignItems: 'center', backgroundColor: '#FEF2F2' },
-  dropdownCancelText: { color: '#EF4444', fontWeight: 'bold', fontSize: 15 }
+  dropdownCancelText: { color: '#EF4444', fontWeight: 'bold', fontSize: 15 },
+  customBadge: { backgroundColor: '#DBEAFE', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
+  customBadgeText: { fontSize: 11, fontWeight: '700', color: '#1D4ED8' },
+  selectRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  selectTrigger: { flex: 1, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#FFF', borderWidth: 1, borderColor: '#CBD5E1', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 13 },
+  selectTriggerDisabled: { backgroundColor: '#F1F5F9', borderColor: '#E2E8F0' },
+  selectTriggerText: { fontSize: 16, color: '#1E293B', flex: 1, marginRight: 8 },
+  selectPlaceholder: { color: '#94A3B8' },
+  clearSelectionBtn: { padding: 4 },
+  inModalOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20, zIndex: 50 },
+  customDropdownOption: { backgroundColor: '#EFF6FF' },
+  customDropdownOptionText: { fontSize: 16, color: '#2563EB', fontWeight: 'bold', textAlign: 'center', width: '100%' }
 });

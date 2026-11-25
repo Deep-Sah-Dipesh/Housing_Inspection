@@ -24,7 +24,13 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
         site_address TEXT,
         inspection_status TEXT DEFAULT 'pending',
         sync_status TEXT DEFAULT 'pending',
+        is_custom INTEGER DEFAULT 0,
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS app_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT
       );
 
       CREATE TABLE IF NOT EXISTS photos (
@@ -44,7 +50,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
     `);
 
     // Schema validation/migrations
-    const existingColumns = await db.getAllAsync(`PRAGMA table_info(beneficiaries);`) as any[];
+    const existingColumns = await db.getAllAsync(`PRAGMA table_info(beneficiaries);`) as { name: string }[];
     const columnNames = existingColumns.map(c => c.name);
     
     const alterQueries = [];
@@ -55,35 +61,85 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
     if (!columnNames.includes('project_name')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN project_name TEXT;`);
     if (!columnNames.includes('site_address')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN site_address TEXT;`);
     if (!columnNames.includes('inspection_status')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN inspection_status TEXT DEFAULT 'pending';`);
+    if (!columnNames.includes('is_custom')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN is_custom INTEGER DEFAULT 0;`);
 
     for (const query of alterQueries) {
       try { await db.execAsync(query); } catch(e) {}
     }
 
-    // ROBUST SEEDING: Target is 9848. If below 9800, we consider it incomplete/empty and re-seed.
-    const { count } = await db.getFirstAsync<{count: number}>(`SELECT COUNT(*) as count FROM beneficiaries`) || { count: 0 };
-    const EXPECTED_MIN_COUNT = 9800; 
-    
-    if (count < EXPECTED_MIN_COUNT) {
-      console.log(`Database incomplete (Count: ${count}). Initializing strict seeding...`);
-      try {
-        const seedData = require('../assets/beneficiaries_seed.json');
-        
-        if (seedData && seedData.length > 0) {
-          // Wipe table before seeding to prevent Primary Key collisions during incomplete recoveries
-          await db.execAsync(`DELETE FROM beneficiaries`);
-          
+    // NON-DESTRUCTIVE SEEDING: Preserves existing inspections, photos, and custom-added projects
+    // while ingesting any new records from updated beneficiaries_seed.json datasets.
+    const { count } = await db.getFirstAsync<{ count: number }>(`SELECT COUNT(*) as count FROM beneficiaries`) || { count: 0 };
+
+    try {
+      interface SeedRecord {
+        code?: string;
+        name?: string;
+        serial_number?: string;
+        mobile_number?: string;
+        aadhar_number?: string;
+        bank_name?: string;
+        account_number?: string;
+        district_name?: string;
+        city_name?: string;
+        annexure_id?: string;
+        father_name?: string;
+        project_name?: string;
+        site_address?: string;
+      }
+      const seedData = require('../assets/beneficiaries_seed.json') as SeedRecord[];
+
+      if (Array.isArray(seedData) && seedData.length > 0) {
+        let hash = 2166136261;
+        for (let i = 0; i < seedData.length; i++) {
+          const item = seedData[i];
+          const sample = `${item.code ?? ''}|${item.name ?? ''}|${item.serial_number ?? ''}|${item.mobile_number ?? ''}|${item.aadhar_number ?? ''}|${item.bank_name ?? ''}|${item.account_number ?? ''}|${item.district_name ?? ''}|${item.city_name ?? ''}|${item.annexure_id ?? ''}|${item.father_name ?? ''}|${item.project_name ?? ''}|${item.site_address ?? ''}`;
+          for (let j = 0; j < sample.length; j++) {
+            hash ^= sample.charCodeAt(j);
+            hash = Math.imul(hash, 16777619);
+          }
+        }
+        const seedSignature = `${seedData.length}:${hash >>> 0}`;
+        const storedMeta = await db.getFirstAsync<{ value: string }>(
+          `SELECT value FROM app_metadata WHERE key = 'seed_signature'`
+        );
+
+        if (count < seedData.length || storedMeta?.value !== seedSignature) {
+          console.log(`Syncing seed dataset (${seedData.length} records, existing DB count: ${count})...`);
           await db.withTransactionAsync(async () => {
             const statement = await db.prepareAsync(`
-              INSERT INTO beneficiaries (code, name, serial_number, district_name, city_name, annexure_id, father_name, project_name, site_address, inspection_status, sync_status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')
+              INSERT INTO beneficiaries (
+                code, name, serial_number, mobile_number, aadhar_number,
+                bank_name, account_number, district_name, city_name,
+                annexure_id, father_name, project_name, site_address,
+                inspection_status, sync_status, is_custom
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 0)
+              ON CONFLICT(code) DO UPDATE SET
+                serial_number = CASE WHEN COALESCE(beneficiaries.serial_number, '') = '' AND excluded.serial_number != '' THEN excluded.serial_number ELSE beneficiaries.serial_number END,
+                mobile_number = CASE WHEN COALESCE(beneficiaries.mobile_number, '') = '' AND excluded.mobile_number != '' THEN excluded.mobile_number ELSE beneficiaries.mobile_number END,
+                aadhar_number = CASE WHEN COALESCE(beneficiaries.aadhar_number, '') = '' AND excluded.aadhar_number != '' THEN excluded.aadhar_number ELSE beneficiaries.aadhar_number END,
+                bank_name = CASE WHEN COALESCE(beneficiaries.bank_name, '') = '' AND excluded.bank_name != '' THEN excluded.bank_name ELSE beneficiaries.bank_name END,
+                account_number = CASE WHEN COALESCE(beneficiaries.account_number, '') = '' AND excluded.account_number != '' THEN excluded.account_number ELSE beneficiaries.account_number END,
+                district_name = CASE WHEN COALESCE(beneficiaries.district_name, '') = '' AND excluded.district_name != '' THEN excluded.district_name ELSE beneficiaries.district_name END,
+                city_name = CASE WHEN COALESCE(beneficiaries.city_name, '') = '' AND excluded.city_name != '' THEN excluded.city_name ELSE beneficiaries.city_name END,
+                annexure_id = CASE WHEN COALESCE(beneficiaries.annexure_id, '') = '' AND excluded.annexure_id != '' THEN excluded.annexure_id ELSE beneficiaries.annexure_id END,
+                father_name = CASE WHEN COALESCE(beneficiaries.father_name, '') = '' AND excluded.father_name != '' THEN excluded.father_name ELSE beneficiaries.father_name END,
+                project_name = CASE WHEN COALESCE(beneficiaries.project_name, '') = '' AND excluded.project_name != '' THEN excluded.project_name ELSE beneficiaries.project_name END,
+                site_address = CASE WHEN COALESCE(beneficiaries.site_address, '') = '' AND excluded.site_address != '' THEN excluded.site_address ELSE beneficiaries.site_address END
             `);
-            
+
             for (const item of seedData) {
+              const cleanCode = item.code ? String(item.code).trim() : '';
+              if (!cleanCode) continue;
               await statement.executeAsync([
-                item.code || '',
+                cleanCode,
                 item.name || '',
                 item.serial_number || '',
+                item.mobile_number || '',
+                item.aadhar_number || '',
+                item.bank_name || '',
+                item.account_number || '',
                 item.district_name || '',
                 item.city_name || '',
                 item.annexure_id || '',
@@ -93,14 +149,19 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
               ]);
             }
             await statement.finalizeAsync();
+
+            await db.runAsync(
+              `INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('seed_signature', ?)`,
+              [seedSignature]
+            );
           });
-          console.log(`Successfully seeded ${seedData.length} projects!`);
+          console.log(`Successfully synced ${seedData.length} seed records without overwriting user data!`);
+        } else {
+          console.log(`Database active and verified. Found ${count} projects. Loading app...`);
         }
-      } catch (seedError) {
-        console.error("Failed to load or parse beneficiaries_seed.json.", seedError);
       }
-    } else {
-      console.log(`Database active and verified. Found ${count} projects. Loading app...`);
+    } catch (seedError) {
+      console.error("Failed to load or parse beneficiaries_seed.json.", seedError);
     }
 
   } catch (error) {

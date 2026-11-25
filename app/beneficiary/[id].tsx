@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, FlatList, Image, Modal, Alert
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as FileSystem from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
 import ViewShot from 'react-native-view-shot';
@@ -123,7 +123,14 @@ export default function BeneficiaryAlbumScreen() {
   const db = useSQLiteContext();
   const insets = useSafeAreaInsets();
   
-  const beneficiaryCode = Array.isArray(id) ? id[0] : (id || '');
+  const rawId = Array.isArray(id) ? id[0] : (id || '');
+  const beneficiaryCode = (() => {
+    try {
+      return decodeURIComponent(rawId);
+    } catch {
+      return rawId;
+    }
+  })();
   
   const [beneficiary, setBeneficiary] = useState<any>(null);
   const [photos, setPhotos] = useState<any[]>([]);
@@ -156,8 +163,11 @@ export default function BeneficiaryAlbumScreen() {
   const [isCapturing, setIsCapturing] = useState(false);
   const isCapturingRef = useRef(false);
 
-  const noteFilename = generatePhotoFilename(beneficiary?.serial_number, beneficiary?.name, beneficiaryCode, 0).replace('.jpg', '_Notes.txt');
-  const targetDir = `${FileSystem.documentDirectory}HousingInspection/${beneficiaryCode}/`;
+  const safeCodeDir = beneficiaryCode.replace(/[\\/:*?"<>|]/g, '_') || 'NO_CODE';
+  const targetDir = new Directory(Paths.document, 'HousingInspection', safeCodeDir);
+  const getNoteFilename = (b: { serial_number?: string; name?: string } | null) =>
+    generatePhotoFilename(b?.serial_number ?? '', b?.name ?? '', beneficiaryCode, 0).replace('.jpg', '_Notes.txt');
+  const noteFilename = getNoteFilename(beneficiary);
 
   useEffect(() => { loadData(); }, [beneficiaryCode]);
 
@@ -173,21 +183,28 @@ export default function BeneficiaryAlbumScreen() {
 
   const loadData = async () => {
     try {
-      const bData = await db.getFirstAsync(`SELECT * FROM beneficiaries WHERE code = ?`, [beneficiaryCode]);
+      const bData = await db.getFirstAsync<{ serial_number?: string; name?: string } & Record<string, unknown>>(
+        `SELECT * FROM beneficiaries WHERE code = ?`,
+        [beneficiaryCode]
+      );
       setBeneficiary(bData);
       const pData = await db.getAllAsync(`SELECT * FROM photos WHERE beneficiary_code = ? ORDER BY created_at DESC`, [beneficiaryCode]);
       setPhotos(pData || []);
-      const notePath = `${targetDir}${noteFilename}`;
-      const noteInfo = await FileSystem.getInfoAsync(notePath);
-      if (noteInfo.exists) setNoteContent(await FileSystem.readAsStringAsync(notePath));
+      const resolvedNoteFile = new File(targetDir, getNoteFilename(bData));
+      if (resolvedNoteFile.exists) {
+        setNoteContent(await resolvedNoteFile.text());
+      } else {
+        const legacyNoteFile = new File(targetDir, getNoteFilename(null));
+        if (legacyNoteFile.exists) setNoteContent(await legacyNoteFile.text());
+      }
     } catch (error) {}
   };
 
   const saveNote = async () => {
     setIsEditingNote(false);
     try {
-      await FileSystem.makeDirectoryAsync(targetDir, { intermediates: true });
-      await FileSystem.writeAsStringAsync(`${targetDir}${noteFilename}`, noteContent.trim());
+      targetDir.create({ intermediates: true, idempotent: true });
+      new File(targetDir, noteFilename).write(noteContent.trim());
     } catch (error) { Alert.alert("Error", "Could not save notes."); }
   };
 
@@ -267,9 +284,13 @@ export default function BeneficiaryAlbumScreen() {
           const stampedUri = await viewShotRef.current?.capture?.();
           if (stampedUri) {
              const filename = generatePhotoFilename(beneficiary?.serial_number, beneficiary?.name, beneficiaryCode, photos.length);
-             await FileSystem.makeDirectoryAsync(targetDir, { intermediates: true });
-             const newUri = `${targetDir}${filename}`;
-             await FileSystem.copyAsync({ from: stampedUri, to: newUri });
+             targetDir.create({ intermediates: true, idempotent: true });
+             const destPhoto = new File(targetDir, filename);
+             if (destPhoto.exists) {
+               destPhoto.delete();
+             }
+             new File(stampedUri).copy(destPhoto);
+             const newUri = destPhoto.uri;
              await db.runAsync(`INSERT INTO photos (id, beneficiary_code, local_uri, filename, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?)`,
                [captureQueue[0].id.toString(), beneficiaryCode, newUri, filename, captureQueue[0].geoData.lat, captureQueue[0].geoData.lon]);
              setImageRefreshKey(Date.now());
@@ -315,7 +336,10 @@ export default function BeneficiaryAlbumScreen() {
       { text: "Cancel", style: "cancel" },
       { text: "Delete", style: "destructive", onPress: async () => {
           try {
-            await FileSystem.deleteAsync(uri, { idempotent: true });
+            const photoFile = new File(uri);
+            if (photoFile.exists) {
+              photoFile.delete();
+            }
             await db.runAsync(`DELETE FROM photos WHERE id = ?`, [photoId]);
             setViewerIndex(null); loadData();
           } catch (e) {}
@@ -327,7 +351,11 @@ export default function BeneficiaryAlbumScreen() {
     try {
       const angle = direction === 'right' ? 90 : -90;
       const manipResult = await ImageManipulator.manipulateAsync(photo.local_uri, [{ rotate: angle }], { compress: 1, format: ImageManipulator.SaveFormat.JPEG });
-      await FileSystem.copyAsync({ from: manipResult.uri, to: photo.local_uri });
+      const destPhoto = new File(photo.local_uri);
+      if (destPhoto.exists) {
+        destPhoto.delete();
+      }
+      new File(manipResult.uri).copy(destPhoto);
       setImageRefreshKey(Date.now());
     } catch (e) { Alert.alert("Error", "Could not rotate."); }
   };
@@ -385,7 +413,7 @@ export default function BeneficiaryAlbumScreen() {
         ListEmptyComponent={<View style={styles.emptyContainer}><Ionicons name="images-outline" size={50} color="#CBD5E1" /><Text style={styles.emptyText}>No geotagged photos taken yet.</Text></View>}
       />
 
-      <View style={styles.fabContainer}>
+      <View style={[styles.fabContainer, { bottom: 30 + insets.bottom }]}>
         <TouchableOpacity style={styles.fab} onPress={openCamera}>
           <Ionicons name="camera" size={28} color="#FFF" />
         </TouchableOpacity>
@@ -504,7 +532,7 @@ const GPSCameraOverlay = ({ geoData, sizeRatio = 1, isLive = false }: { geoData:
   return (
     <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%', paddingHorizontal: 0, paddingBottom: 0 }} collapsable={false}>
       <View style={{ width: 90 * sizeRatio, height: 90 * sizeRatio, borderRadius: 8 * sizeRatio, overflow: 'hidden', marginRight: 6 * sizeRatio, backgroundColor: '#E2E8F0', borderWidth: 1 * sizeRatio, borderColor: '#FFF' }} collapsable={false}>
-         {geoData.lat === "0.000000" ? <View style={{flex: 1, justifyContent: 'center', alignItems: 'center'}}><Ionicons name="map" size={24 * sizeRatio} color="#94A3B8" /></View> : <Image source={{ uri: mapUrl }} style={{ flex: 1, width: '100%', height: '100%', resizeMode: 'cover' }} collapsable={false} />}
+         {geoData.lat === "0.000000" ? <View style={{flex: 1, justifyContent: 'center', alignItems: 'center'}}><Ionicons name="map" size={24 * sizeRatio} color="#94A3B8" /></View> : <Image source={{ uri: mapUrl }} style={{ flex: 1, width: '100%', height: '100%', resizeMode: 'cover' }} />}
       </View>
       <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 8 * sizeRatio, paddingHorizontal: 8 * sizeRatio, paddingVertical: 5 * sizeRatio, justifyContent: 'center', minHeight: 90 * sizeRatio }} collapsable={false}>
          <Text allowFontScaling={false} style={{ color: '#FFF', fontSize: 14 * sizeRatio, fontWeight: 'bold' }} numberOfLines={1}>{geoData.shortLocation}</Text>

@@ -1,4 +1,4 @@
-import * as FileSystem from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as SQLite from 'expo-sqlite';
 import * as XLSX from 'xlsx';
@@ -17,7 +17,7 @@ export const exportFilteredDataToExcel = async (
         b.site_address,
         MIN(p.created_at) as photo_timestamp
       FROM beneficiaries b
-      LEFT JOIN photos p ON p.beneficiary_id = b.id
+      LEFT JOIN photos p ON p.beneficiary_code = b.code
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -78,14 +78,12 @@ export const exportFilteredDataToExcel = async (
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const locationTag = city || district || 'Dashboard_Selection';
     const fileName = `Export_${locationTag}_${timestamp}.xlsx`;
-    const fileUri = `${FileSystem.documentDirectory}${fileName}`;
+    const exportFile = new File(Paths.document, fileName);
 
-    await FileSystem.writeAsStringAsync(fileUri, wbout, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
+    exportFile.write(wbout, { encoding: 'base64' });
 
     if (await Sharing.isAvailableAsync()) {
-      await Sharing.shareAsync(fileUri, {
+      await Sharing.shareAsync(exportFile.uri, {
         mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         dialogTitle: 'Export Beneficiary Template',
       });

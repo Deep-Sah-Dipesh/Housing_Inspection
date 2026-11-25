@@ -1,17 +1,19 @@
+import fs from "fs";
+
 export default {
   expo: {
     name: "Housing Inspection",
     slug: "Housing_Inspection",
     scheme: "com.deepsah.housinginspection",
-    version: "2.1.1",
+    version: "2.2.0",
     orientation: "portrait",
     icon: "./assets/Housing_Inspection_Logo.png",
     userInterfaceStyle: "light",
 
     // --- EAS UPDATE SETTINGS ---
+    // Channel routing is managed per build profile in eas.json (preview / production)
     updates: {
       url: "https://u.expo.dev/ffe75714-4533-4d6f-927e-9a679e0a8db3",
-      channel: "preview"
     },
     runtimeVersion: {
       policy: "appVersion"
@@ -20,11 +22,11 @@ export default {
 
     ios: {
       supportsTablet: true,
-      buildNumber: "6",
+      buildNumber: "7",
     },
 
     android: {
-      versionCode: 6,
+      versionCode: 7,
       adaptiveIcon: {
         backgroundColor: "#E6F4FE",
         foregroundImage: "./assets/android-icon-foreground.png",
@@ -34,7 +36,9 @@ export default {
       package: "com.deepsah.housinginspection",
 
       // <-- This is the important change
-      googleServicesFile: process.env.GOOGLE_SERVICES_JSON,
+      googleServicesFile:
+        process.env.GOOGLE_SERVICES_JSON ||
+        (fs.existsSync("./google-services.json") ? "./google-services.json" : undefined),
 
       permissions: [
         "android.permission.CAMERA",
@@ -52,6 +56,7 @@ export default {
       "expo-router",
       "expo-camera",
       "expo-location",
+      "expo-font",
       "expo-sqlite",
       [
         "expo-splash-screen",
