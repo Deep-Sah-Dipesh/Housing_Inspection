@@ -1,4 +1,5 @@
 import * as SQLite from 'expo-sqlite';
+import { SEED_DATA, SEED_DATASET_TIMESTAMP } from './seedLoader';
 
 export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
   try {
@@ -87,7 +88,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
         project_name?: string;
         site_address?: string;
       }
-      const seedData = require('../assets/beneficiaries_seed.json') as SeedRecord[];
+      const seedData = SEED_DATA as SeedRecord[];
 
       if (Array.isArray(seedData) && seedData.length > 0) {
         let hash = 2166136261;
@@ -99,7 +100,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
             hash = Math.imul(hash, 16777619);
           }
         }
-        const seedSignature = `${seedData.length}:${hash >>> 0}`;
+        const seedSignature = `${SEED_DATASET_TIMESTAMP}:${seedData.length}:${hash >>> 0}`;
         const storedMeta = await db.getFirstAsync<{ value: string }>(
           `SELECT value FROM app_metadata WHERE key = 'seed_signature'`
         );
@@ -122,7 +123,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
                 bank_name = CASE WHEN COALESCE(beneficiaries.bank_name, '') = '' AND excluded.bank_name != '' THEN excluded.bank_name ELSE beneficiaries.bank_name END,
                 account_number = CASE WHEN COALESCE(beneficiaries.account_number, '') = '' AND excluded.account_number != '' THEN excluded.account_number ELSE beneficiaries.account_number END,
                 district_name = CASE WHEN COALESCE(beneficiaries.district_name, '') = '' AND excluded.district_name != '' THEN excluded.district_name ELSE beneficiaries.district_name END,
-                city_name = CASE WHEN COALESCE(beneficiaries.city_name, '') = '' AND excluded.city_name != '' THEN excluded.city_name ELSE beneficiaries.city_name END,
+                city_name = CASE WHEN excluded.city_name != '' THEN excluded.city_name ELSE beneficiaries.city_name END,
                 annexure_id = CASE WHEN COALESCE(beneficiaries.annexure_id, '') = '' AND excluded.annexure_id != '' THEN excluded.annexure_id ELSE beneficiaries.annexure_id END,
                 father_name = CASE WHEN COALESCE(beneficiaries.father_name, '') = '' AND excluded.father_name != '' THEN excluded.father_name ELSE beneficiaries.father_name END,
                 project_name = CASE WHEN COALESCE(beneficiaries.project_name, '') = '' AND excluded.project_name != '' THEN excluded.project_name ELSE beneficiaries.project_name END,

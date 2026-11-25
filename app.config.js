@@ -9,6 +9,7 @@ export default {
     orientation: "portrait",
     icon: "./assets/Housing_Inspection_Logo.png",
     userInterfaceStyle: "light",
+    backgroundColor: "#F8FAFC",
 
     // --- EAS UPDATE SETTINGS ---
     // Channel routing is managed per build profile in eas.json (preview / production)

@@ -56,4 +56,4 @@ credentials.json
 databases_and_scripts/processed/
 
 # Force-include locally generated seed dataset for EAS Build / EAS Update bundling
-!assets/beneficiaries_seed.json
+!assets/beneficiaries_seed*.json

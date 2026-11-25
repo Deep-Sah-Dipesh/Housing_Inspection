@@ -551,7 +551,15 @@ export default function DashboardScreen() {
 
         <View style={styles.searchContainer}>
           <Ionicons name="search" size={20} color="#94A3B8" />
-          <TextInput style={styles.searchInput} placeholder="Search Application No. or Name..." value={searchQuery} onChangeText={setSearchQuery} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search Application No. or Name..."
+            placeholderTextColor="#94A3B8"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            multiline={false}
+            numberOfLines={1}
+          />
           {searchQuery.length > 0 && (
             <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={{top: 10, bottom: 10, left: 10, right: 10}}>
               <Ionicons name="close-circle" size={20} color="#94A3B8" />
@@ -756,8 +764,8 @@ const styles = StyleSheet.create({
   title: { fontSize: 24, fontWeight: 'bold', color: '#1E293B' },
   advancedBadge: { backgroundColor: '#EF4444', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, marginLeft: 10 },
   advancedBadgeText: { color: '#FFF', fontSize: 10, fontWeight: 'bold' },
-  searchContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 15, paddingVertical: 10, marginBottom: 10 },
-  searchInput: { flex: 1, marginLeft: 10, marginRight: 5, fontSize: 16, color: '#1E293B' },
+  searchContainer: { flexDirection: 'row', alignItems: 'center', width: '100%', height: 46, backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 14, marginBottom: 10 },
+  searchInput: { flex: 1, minWidth: 0, height: '100%', marginLeft: 10, marginRight: 6, fontSize: 15, color: '#1E293B', paddingVertical: 0 },
   
   filterWrapper: { flexDirection: 'row', alignItems: 'center', width: '100%' },
   filterScrollContent: { flexDirection: 'row', alignItems: 'center', gap: 8 },

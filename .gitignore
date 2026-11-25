@@ -53,5 +53,5 @@ credentials.json
 *.csv
 *.db
 *.sqlite
-assets/beneficiaries_seed.json
+assets/beneficiaries_seed*.json
 databases_and_scripts/processed/

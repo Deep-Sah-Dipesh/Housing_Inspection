@@ -40,14 +40,44 @@ const formatGeoDate = (d: Date) => {
   return `${days[d.getDay()]}, ${p(d.getDate())}/${p(d.getMonth()+1)}/${yy} ${p(h12)}:${p(d.getMinutes())}:${p(d.getSeconds())} ${ampm} GMT ${sign}${offH}:${offM}`;
 };
 
-// Fixed width label with Flex 1 value strictly ensures text wraps into a distinct right-side column
-const DetailRow = ({ label, value }: { label: string, value: any }) => (
-  <View style={styles.detailRow}>
-    <Text style={styles.detailLabel}>{label}</Text>
-    <Text style={styles.detailColon}>:</Text>
-    <Text style={styles.detailValue}>{toTitleCase(value)}</Text>
-  </View>
-);
+// Single-line key label with colon right after key and hanging paragraph indentation
+const DETAIL_INDENT_LEFT = 32;
+
+const DetailRow = ({ label, value }: { label: string; value: string | undefined | null }) => {
+  const [labelWidth, setLabelWidth] = useState(110);
+  const formattedValue = toTitleCase(value ?? undefined);
+
+  if (label === 'Annexure ID') {
+    return (
+      <View style={styles.annexureRow}>
+        <Text style={styles.annexureLabel} numberOfLines={1}>
+          {label}  :{' '}
+        </Text>
+        <Text style={styles.annexureValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82}>
+          {formattedValue}
+        </Text>
+      </View>
+    );
+  }
+
+  const spacerWidth = Math.max(0, labelWidth - DETAIL_INDENT_LEFT + 6);
+
+  return (
+    <View style={styles.detailRow}>
+      <Text
+        style={styles.detailLabel}
+        numberOfLines={1}
+        onLayout={(e) => setLabelWidth(e.nativeEvent.layout.width)}
+      >
+        {label}  :
+      </Text>
+      <Text style={styles.detailValue}>
+        <View style={{ width: spacerWidth, height: 1 }} />
+        {formattedValue}
+      </Text>
+    </View>
+  );
+};
 
 const BeneficiaryHeader = React.memo(({ beneficiary, id, photosCount }: any) => (
   <View style={styles.headerContainer}>
@@ -91,7 +121,7 @@ const BeneficiaryHeader = React.memo(({ beneficiary, id, photosCount }: any) => 
 const BeneficiaryFooter = React.memo(({ noteContent, setNoteContent, isEditingNote, setIsEditingNote, saveNote }: any) => (
   <View style={styles.notesContainer}>
     <View style={styles.sectionHeaderRow}>
-      <Text style={styles.sectionTitle}>Inspection Notes</Text>
+      <Text style={styles.sectionTitle}>Inspection Note</Text>
       {!isEditingNote && (
         <TouchableOpacity onPress={() => setIsEditingNote(true)} style={styles.editNoteIcon}>
           <Ionicons name="pencil" size={18} color="#2563EB" />
@@ -560,10 +590,12 @@ const styles = StyleSheet.create({
   beneficiaryCode: { fontSize: 16, color: '#1E293B', marginTop: 4, fontWeight: 'bold', textAlign: 'center' },
   divider: { height: 1, backgroundColor: '#F1F5F9', marginVertical: 12 },
   
-  detailRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 8, paddingHorizontal: 10 },
-  detailLabel: { fontSize: 14, color: '#1E293B', fontWeight: '900', width: 100 },
-  detailColon: { fontSize: 14, color: '#1E293B', fontWeight: '900', marginRight: 6 },
-  detailValue: { fontSize: 14, color: '#334155', flex: 1, textAlign: 'justify', fontWeight: '600', lineHeight: 20 },
+  annexureRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10, marginHorizontal: 6 },
+  annexureLabel: { fontSize: 15, color: '#1E293B', fontWeight: '900', lineHeight: 22 },
+  annexureValue: { flex: 1, fontSize: 15, color: '#334155', fontWeight: '600', lineHeight: 22 },
+  detailRow: { position: 'relative', marginBottom: 10, paddingLeft: DETAIL_INDENT_LEFT, marginHorizontal: 6 },
+  detailLabel: { position: 'absolute', left: 0, top: 0, fontSize: 16, color: '#1E293B', fontWeight: '900', lineHeight: 23 },
+  detailValue: { fontSize: 16, color: '#334155', textAlign: 'left', fontWeight: '600', lineHeight: 23 },
   
   detailsGrid: { flexDirection: 'row', justifyContent: 'space-around', paddingTop: 5 },
   detailItem: { alignItems: 'center' },
