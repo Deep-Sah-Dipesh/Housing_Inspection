@@ -13,9 +13,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export interface BeneficiaryItem {
   code: string;
+  original_code?: string | null;
   name: string;
   district_name: string;
   city_name: string;
+  author_name?: string | null;
   photo_count: number;
   sync_status: string;
   inspection_status: string;
@@ -65,7 +67,9 @@ export default function DashboardScreen() {
   
   const [uniqueDistricts, setUniqueDistricts] = useState<string[]>([]);
   const [uniqueCities, setUniqueCities] = useState<string[]>([]);
-  const [activeDropdown, setActiveDropdown] = useState<'district' | 'city' | 'sort' | null>(null);
+  const [uniqueAuthors, setUniqueAuthors] = useState<string[]>([]);
+  const [selectedAuthors, setSelectedAuthors] = useState<string[] | null>(null);
+  const [activeDropdown, setActiveDropdown] = useState<'district' | 'city' | 'sort' | 'author' | null>(null);
 
   const [showPdfSettings, setShowPdfSettings] = useState(false);
   const [pdfRows, setPdfRows] = useState('2');
@@ -96,6 +100,19 @@ export default function DashboardScreen() {
       cityQuery += ` ORDER BY city_name ASC`;
       const cits = await db.getAllAsync<{city_name: string}>(cityQuery, cityParams);
       setUniqueCities(cits.map(c => c.city_name));
+
+      const authorRows = await db.getAllAsync<{ author_label: string }>(
+        `SELECT DISTINCT COALESCE(NULLIF(TRIM(b.author_name), ''), NULLIF(TRIM(p.author_name), ''), 'Unassigned') as author_label
+         FROM beneficiaries b
+         INNER JOIN photos p ON b.code = p.beneficiary_code
+         ORDER BY author_label ASC`
+      );
+      const authorsList = authorRows.map((a) => a.author_label);
+      const sortedAuthors = [
+        ...authorsList.filter((a) => a !== 'Unassigned'),
+        ...(authorsList.includes('Unassigned') ? ['Unassigned'] : []),
+      ];
+      setUniqueAuthors(sortedAuthors);
     } catch (error) {}
   }, [db, dashDistrict]);
 
@@ -103,16 +120,18 @@ export default function DashboardScreen() {
     setIsLoading(true);
     try {
       let query = `
-        SELECT b.code, b.name, b.district_name, b.city_name, b.sync_status, b.inspection_status, MAX(p.created_at) as last_updated, COUNT(p.id) as photo_count
+        SELECT b.code, b.original_code, b.name, b.district_name, b.city_name,
+               COALESCE(NULLIF(TRIM(b.author_name), ''), NULLIF(TRIM(MAX(p.author_name)), ''), 'Unassigned') as author_name,
+               b.sync_status, b.inspection_status, MAX(p.created_at) as last_updated, COUNT(p.id) as photo_count
         FROM beneficiaries b
         INNER JOIN photos p ON b.code = p.beneficiary_code
         WHERE 1=1
       `;
-      const params: any[] = [];
+      const params: (string | number)[] = [];
 
       if (searchQuery) {
-        query += ` AND (b.name LIKE ? OR b.code LIKE ?)`;
-        params.push(`%${searchQuery}%`, `%${searchQuery}%`);
+        query += ` AND (b.name LIKE ? OR b.code LIKE ? OR b.original_code LIKE ?)`;
+        params.push(`%${searchQuery}%`, `%${searchQuery}%`, `%${searchQuery}%`);
       }
       if (dashDistrict) {
         query += ` AND b.district_name = ?`;
@@ -195,6 +214,13 @@ export default function DashboardScreen() {
         combinedResults.sort((a, b) => b.name.localeCompare(a.name));
       }
 
+      if (selectedAuthors !== null) {
+        const allowed = new Set(selectedAuthors);
+        combinedResults = combinedResults.filter((item) =>
+          allowed.has(item.author_name?.trim() || 'Unassigned')
+        );
+      }
+
       const groups = combinedResults.reduce((acc: any, current) => {
         const dateObj = new Date(current.last_updated);
         const dateStr = !isNaN(dateObj.getTime())
@@ -221,7 +247,7 @@ export default function DashboardScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [db, searchQuery, dashDistrict, dashCity, sortMode, isAdvancedMode]);
+  }, [db, searchQuery, dashDistrict, dashCity, sortMode, isAdvancedMode, selectedAuthors]);
 
   useFocusEffect(
     useCallback(() => {
@@ -492,43 +518,117 @@ export default function DashboardScreen() {
     }
   };
 
-  const renderDropdownModal = () => (
-    <Modal visible={activeDropdown !== null} transparent animationType="fade">
-      <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setActiveDropdown(null)}>
-        <View style={styles.dropdownCard}>
-          <Text style={styles.dropdownTitle}>
-            {activeDropdown === 'district' ? 'Select District' : activeDropdown === 'city' ? 'Select City' : 'Sort By'}
-          </Text>
-          <ScrollView style={{ maxHeight: 300 }}>
-            {activeDropdown === 'sort' && SORT_OPTIONS.map((opt) => (
-              <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setSortMode(opt); setActiveDropdown(null); }}>
-                <Text style={[styles.dropdownOptionText, sortMode === opt && styles.dropdownOptionSelectedText]}>{opt}</Text>
+  const toggleAuthorOption = (author: string) => {
+    const current = selectedAuthors === null ? [...uniqueAuthors] : [...selectedAuthors];
+    const idx = current.indexOf(author);
+    if (idx !== -1) {
+      current.splice(idx, 1);
+    } else {
+      current.push(author);
+    }
+    if (uniqueAuthors.length > 0 && current.length === uniqueAuthors.length) {
+      setSelectedAuthors(null);
+    } else {
+      setSelectedAuthors(current);
+    }
+  };
+
+  const toggleSelectAllAuthors = () => {
+    const allSelected = selectedAuthors === null || selectedAuthors.length === uniqueAuthors.length;
+    setSelectedAuthors(allSelected ? [] : null);
+  };
+
+  const getAuthorButtonLabel = (): string => {
+    if (selectedAuthors === null) return 'Author';
+    if (selectedAuthors.length === 0) return 'No Author';
+    if (selectedAuthors.length === 1) return getFirstWord(selectedAuthors[0]) || 'Author';
+    return `Author (${selectedAuthors.length})`;
+  };
+
+  const renderDropdownModal = () => {
+    const allAuthorsChecked =
+      selectedAuthors === null ||
+      (uniqueAuthors.length > 0 && selectedAuthors.length === uniqueAuthors.length);
+
+    return (
+      <Modal visible={activeDropdown !== null} transparent animationType="fade">
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setActiveDropdown(null)}>
+          <TouchableWithoutFeedback>
+            <View style={styles.dropdownCard}>
+              <Text style={styles.dropdownTitle}>
+                {activeDropdown === 'district'
+                  ? 'Select District'
+                  : activeDropdown === 'city'
+                  ? 'Select City'
+                  : activeDropdown === 'author'
+                  ? 'Filter by Author'
+                  : 'Sort By'}
+              </Text>
+              <ScrollView style={{ maxHeight: 320 }}>
+                {activeDropdown === 'sort' && SORT_OPTIONS.map((opt) => (
+                  <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setSortMode(opt); setActiveDropdown(null); }}>
+                    <Text style={[styles.dropdownOptionText, sortMode === opt && styles.dropdownOptionSelectedText]}>{opt}</Text>
+                  </TouchableOpacity>
+                ))}
+                {activeDropdown === 'district' && ['All Districts', ...uniqueDistricts].map((opt) => {
+                  const isSelected = dashDistrict === opt || (!dashDistrict && opt === 'All Districts');
+                  return (
+                    <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashDistrict(opt === 'All Districts' ? null : opt); setActiveDropdown(null); }}>
+                      <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+                {activeDropdown === 'city' && ['All Cities', ...uniqueCities].map((opt) => {
+                  const isSelected = dashCity === opt || (!dashCity && opt === 'All Cities');
+                  return (
+                    <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashCity(opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
+                      <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+                {activeDropdown === 'author' && (
+                  <>
+                    <TouchableOpacity style={styles.authorOptionRow} onPress={toggleSelectAllAuthors}>
+                      <View style={[styles.authorCheckbox, allAuthorsChecked && styles.checkboxSelected]}>
+                        {allAuthorsChecked && <Ionicons name="checkmark" size={14} color="#FFF" />}
+                      </View>
+                      <Text style={[styles.authorOptionText, { fontWeight: '800', color: '#0F172A' }]}>
+                        Select All Authors
+                      </Text>
+                    </TouchableOpacity>
+                    {uniqueAuthors.map((author) => {
+                      const isChecked =
+                        selectedAuthors === null || selectedAuthors.includes(author);
+                      return (
+                        <TouchableOpacity
+                          key={author}
+                          style={styles.authorOptionRow}
+                          onPress={() => toggleAuthorOption(author)}
+                        >
+                          <View style={[styles.authorCheckbox, isChecked && styles.checkboxSelected]}>
+                            {isChecked && <Ionicons name="checkmark" size={14} color="#FFF" />}
+                          </View>
+                          <Text style={styles.authorOptionText}>{author}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </>
+                )}
+              </ScrollView>
+              <TouchableOpacity
+                style={activeDropdown === 'author' ? styles.dropdownDoneBtn : styles.dropdownCancelBtn}
+                onPress={() => setActiveDropdown(null)}
+              >
+                <Text style={activeDropdown === 'author' ? styles.dropdownDoneText : styles.dropdownCancelText}>
+                  {activeDropdown === 'author' ? 'Done' : 'Cancel'}
+                </Text>
               </TouchableOpacity>
-            ))}
-            {activeDropdown === 'district' && ['All Districts', ...uniqueDistricts].map((opt) => {
-              const isSelected = dashDistrict === opt || (!dashDistrict && opt === 'All Districts');
-              return (
-                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashDistrict(opt === 'All Districts' ? null : opt); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
-                </TouchableOpacity>
-              );
-            })}
-            {activeDropdown === 'city' && ['All Cities', ...uniqueCities].map((opt) => {
-              const isSelected = dashCity === opt || (!dashCity && opt === 'All Cities');
-              return (
-                <TouchableOpacity key={opt} style={styles.dropdownOption} onPress={() => { setDashCity(opt === 'All Cities' ? null : opt); setActiveDropdown(null); }}>
-                  <Text style={[styles.dropdownOptionText, isSelected && styles.dropdownOptionSelectedText]}>{toTitleCase(opt)}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </ScrollView>
-          <TouchableOpacity style={styles.dropdownCancelBtn} onPress={() => setActiveDropdown(null)}>
-            <Text style={styles.dropdownCancelText}>Cancel</Text>
-          </TouchableOpacity>
-        </View>
-      </TouchableOpacity>
-    </Modal>
-  );
+            </View>
+          </TouchableWithoutFeedback>
+        </TouchableOpacity>
+      </Modal>
+    );
+  };
 
   const renderedSections = rawGroupedData.map(sec => ({
     title: sec.title,
@@ -569,6 +669,11 @@ export default function DashboardScreen() {
 
         <View style={styles.filterWrapper}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flex: 1 }} contentContainerStyle={styles.filterScrollContent}>
+            <TouchableOpacity style={[styles.filterBtn, sortMode !== 'Recently Inspected' && styles.filterBtnActive]} onPress={() => setActiveDropdown('sort')}>
+              <Ionicons name="swap-vertical" size={14} color={sortMode !== 'Recently Inspected' ? "#2563EB" : "#64748B"} style={{marginRight: 4}} />
+              <Text style={[styles.filterBtnText, sortMode !== 'Recently Inspected' && styles.filterBtnTextActive]} numberOfLines={1}>{getShortSortName(sortMode)}</Text>
+            </TouchableOpacity>
+
             <TouchableOpacity style={[styles.filterBtn, dashDistrict && styles.filterBtnActive]} onPress={() => setActiveDropdown('district')}>
               <Text style={[styles.filterBtnText, dashDistrict && styles.filterBtnTextActive]} numberOfLines={1}>{getFirstWord(dashDistrict) || 'District'}</Text>
               <Ionicons name="chevron-down" size={14} color={dashDistrict ? "#2563EB" : "#64748B"} />
@@ -578,16 +683,17 @@ export default function DashboardScreen() {
               <Text style={[styles.filterBtnText, dashCity && styles.filterBtnTextActive]} numberOfLines={1}>{getFirstWord(dashCity) || 'City'}</Text>
               <Ionicons name="chevron-down" size={14} color={dashCity ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
-            
-            <TouchableOpacity style={[styles.filterBtn, sortMode !== 'Recently Inspected' && styles.filterBtnActive]} onPress={() => setActiveDropdown('sort')}>
-              <Ionicons name="swap-vertical" size={14} color={sortMode !== 'Recently Inspected' ? "#2563EB" : "#64748B"} style={{marginRight: 4}} />
-              <Text style={[styles.filterBtnText, sortMode !== 'Recently Inspected' && styles.filterBtnTextActive]} numberOfLines={1}>{getShortSortName(sortMode)}</Text>
+
+            <TouchableOpacity style={[styles.filterBtn, selectedAuthors !== null && styles.filterBtnActive]} onPress={() => setActiveDropdown('author')}>
+              <Ionicons name="person-outline" size={13} color={selectedAuthors !== null ? "#2563EB" : "#64748B"} style={{marginRight: 4}} />
+              <Text style={[styles.filterBtnText, selectedAuthors !== null && styles.filterBtnTextActive]} numberOfLines={1}>{getAuthorButtonLabel()}</Text>
+              <Ionicons name="chevron-down" size={14} color={selectedAuthors !== null ? "#2563EB" : "#64748B"} />
             </TouchableOpacity>
           </ScrollView>
 
-          {(dashDistrict || dashCity || sortMode !== 'Recently Inspected') && (
+          {(dashDistrict || dashCity || sortMode !== 'Recently Inspected' || selectedAuthors !== null) && (
             <View style={{ paddingLeft: 8 }}>
-              <TouchableOpacity onPress={() => { setDashDistrict(null); setDashCity(null); setSortMode('Recently Inspected'); setSearchQuery(''); }} style={styles.fixedClearBtn}>
+              <TouchableOpacity onPress={() => { setDashDistrict(null); setDashCity(null); setSortMode('Recently Inspected'); setSelectedAuthors(null); setSearchQuery(''); }} style={styles.fixedClearBtn}>
                 <Ionicons name="close-circle" size={26} color="#EF4444" />
               </TouchableOpacity>
             </View>
@@ -640,7 +746,7 @@ export default function DashboardScreen() {
                     <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
                   </View>
                   <View style={styles.cardSubRow}>
-                    <Text style={styles.itemCode}>ID: {item.code}</Text>
+                    <Text style={styles.itemCode}>ID: {item.original_code || item.code}</Text>
                     
                     <View style={{flexDirection: 'row', alignItems: 'center'}}>
                       <View style={[styles.photoCountBadge, item.is_legacy && {backgroundColor: '#FEF3C7'}]}>
@@ -652,6 +758,14 @@ export default function DashboardScreen() {
                   </View>
                   <View style={styles.cardFooter}>
                     <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {item.is_legacy ? 'Device Directory' : (toTitleCase(item.city_name) || 'N/A')}</Text>
+                    {!item.is_legacy && (
+                      <View style={styles.authorBadge}>
+                        <Ionicons name="person-outline" size={11} color="#475569" style={{ marginRight: 4 }} />
+                        <Text style={styles.authorBadgeText} numberOfLines={1}>
+                          {item.author_name || 'Unassigned'}
+                        </Text>
+                      </View>
+                    )}
                   </View>
                 </TouchableOpacity>
               </View>
@@ -827,5 +941,12 @@ const styles = StyleSheet.create({
   dropdownOptionText: { fontSize: 16, color: '#475569', textAlign: 'center', width: '100%' },
   dropdownOptionSelectedText: { color: '#2563EB', fontWeight: 'bold' },
   dropdownCancelBtn: { padding: 15, alignItems: 'center', backgroundColor: '#FEF2F2' },
-  dropdownCancelText: { color: '#EF4444', fontWeight: 'bold', fontSize: 15 }
+  dropdownCancelText: { color: '#EF4444', fontWeight: 'bold', fontSize: 15 },
+  dropdownDoneBtn: { padding: 15, alignItems: 'center', backgroundColor: '#EFF6FF', borderTopWidth: 1, borderColor: '#E2E8F0' },
+  dropdownDoneText: { color: '#2563EB', fontWeight: 'bold', fontSize: 15 },
+  authorOptionRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 18, borderBottomWidth: 1, borderColor: '#F1F5F9' },
+  authorCheckbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: '#CBD5E1', marginRight: 12, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFF' },
+  authorOptionText: { fontSize: 15, color: '#334155', fontWeight: '600', flex: 1 },
+  authorBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, maxWidth: '55%', borderWidth: 1, borderColor: '#E2E8F0' },
+  authorBadgeText: { fontSize: 11, color: '#475569', fontWeight: '600' }
 });

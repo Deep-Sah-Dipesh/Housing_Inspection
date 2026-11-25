@@ -12,6 +12,14 @@ import { Accelerometer } from 'expo-sensors';
 import { generatePhotoFilename } from '../../utils/fileHelpers';
 import { GOOGLE_MAPS_API_KEY } from '../../utils/firebaseConfig';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useAppStore } from '../../store/appStore';
+import {
+  formatDisplayDateTime,
+  ProjectMeta,
+  readProjectMeta,
+  resolveAuthorName,
+  writeProjectMeta,
+} from '../../utils/authorHelpers';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const COLUMN_COUNT = 2;
@@ -79,14 +87,51 @@ const DetailRow = ({ label, value }: { label: string; value: string | undefined 
   );
 };
 
-const BeneficiaryHeader = React.memo(({ beneficiary, id, photosCount }: any) => (
+interface BeneficiaryDetailRecord {
+  code: string;
+  original_code?: string | null;
+  name?: string;
+  serial_number?: string;
+  annexure_id?: string;
+  project_name?: string;
+  father_name?: string;
+  district_name?: string;
+  city_name?: string;
+  site_address?: string;
+  sync_status?: string;
+  author_name?: string | null;
+  last_updated?: string | null;
+}
+
+interface PhotoRecord {
+  id: string;
+  beneficiary_code: string;
+  local_uri: string;
+  filename: string;
+  latitude?: string;
+  longitude?: string;
+  author_name?: string | null;
+  created_at?: string;
+}
+
+interface BeneficiaryHeaderProps {
+  beneficiary: BeneficiaryDetailRecord | null;
+  id: string;
+  photosCount: number;
+  authorDisplay: string;
+  originalDateDisplay: string;
+}
+
+const BeneficiaryHeader = React.memo(({ beneficiary, id, photosCount, authorDisplay, originalDateDisplay }: BeneficiaryHeaderProps) => (
   <View style={styles.headerContainer}>
     <View style={styles.detailsCard}>
       <View style={styles.detailsHeader}>
         <View style={styles.avatarCircle}><Ionicons name="person" size={28} color="#2563EB" /></View>
         <View style={styles.detailsHeaderText}>
           <Text style={styles.beneficiaryName}>{toTitleCase(beneficiary?.name) || 'Name not provided'}</Text>
-          <Text style={styles.beneficiaryCode} numberOfLines={1} adjustsFontSizeToFit>ID: {id}</Text>
+          <Text style={styles.beneficiaryCode} numberOfLines={1} adjustsFontSizeToFit>
+            ID: {beneficiary?.original_code || id}
+          </Text>
         </View>
       </View>
       
@@ -114,6 +159,29 @@ const BeneficiaryHeader = React.memo(({ beneficiary, id, photosCount }: any) => 
         </View>
       </View>
     </View>
+
+    <View style={styles.authorInfoCard}>
+      <View style={styles.authorInfoRow}>
+        <View style={styles.authorIconBadge}>
+          <Ionicons name="shield-checkmark-outline" size={18} color="#2563EB" />
+        </View>
+        <View style={styles.authorInfoTextCol}>
+          <Text style={styles.authorInfoLabel}>Reporting Agent / Author</Text>
+          <Text style={styles.authorInfoValue}>{authorDisplay}</Text>
+        </View>
+      </View>
+      <View style={styles.authorInfoDivider} />
+      <View style={styles.authorInfoRow}>
+        <View style={[styles.authorIconBadge, { backgroundColor: '#F0FDF4' }]}>
+          <Ionicons name="time-outline" size={18} color="#059669" />
+        </View>
+        <View style={styles.authorInfoTextCol}>
+          <Text style={styles.authorInfoLabel}>Original Date & Time</Text>
+          <Text style={styles.authorInfoValue}>{originalDateDisplay}</Text>
+        </View>
+      </View>
+    </View>
+
     <Text style={[styles.sectionTitle, { paddingHorizontal: 15, marginBottom: 10 }]}>Geocaptured Images ({photosCount})</Text>
   </View>
 ));
@@ -162,8 +230,12 @@ export default function BeneficiaryAlbumScreen() {
     }
   })();
   
-  const [beneficiary, setBeneficiary] = useState<any>(null);
-  const [photos, setPhotos] = useState<any[]>([]);
+  const { officialName, userName } = useAppStore();
+  const currentAuthorName = resolveAuthorName(officialName, userName);
+
+  const [beneficiary, setBeneficiary] = useState<BeneficiaryDetailRecord | null>(null);
+  const [photos, setPhotos] = useState<PhotoRecord[]>([]);
+  const [projectMeta, setProjectMeta] = useState<ProjectMeta | null>(null);
   const [imageRefreshKey, setImageRefreshKey] = useState(Date.now());
   
   const [noteContent, setNoteContent] = useState('');
@@ -213,13 +285,18 @@ export default function BeneficiaryAlbumScreen() {
 
   const loadData = async () => {
     try {
-      const bData = await db.getFirstAsync<{ serial_number?: string; name?: string } & Record<string, unknown>>(
+      const bData = await db.getFirstAsync<BeneficiaryDetailRecord>(
         `SELECT * FROM beneficiaries WHERE code = ?`,
         [beneficiaryCode]
       );
       setBeneficiary(bData);
-      const pData = await db.getAllAsync(`SELECT * FROM photos WHERE beneficiary_code = ? ORDER BY created_at DESC`, [beneficiaryCode]);
+      const pData = await db.getAllAsync<PhotoRecord>(
+        `SELECT * FROM photos WHERE beneficiary_code = ? ORDER BY created_at DESC`,
+        [beneficiaryCode]
+      );
       setPhotos(pData || []);
+      const meta = await readProjectMeta(targetDir);
+      setProjectMeta(meta);
       const resolvedNoteFile = new File(targetDir, getNoteFilename(bData));
       if (resolvedNoteFile.exists) {
         setNoteContent(await resolvedNoteFile.text());
@@ -235,6 +312,20 @@ export default function BeneficiaryAlbumScreen() {
     try {
       targetDir.create({ intermediates: true, idempotent: true });
       new File(targetDir, noteFilename).write(noteContent.trim());
+      const effectiveAuthor = beneficiary?.author_name?.trim() || currentAuthorName;
+      await db.runAsync(
+        `UPDATE beneficiaries SET author_name = COALESCE(NULLIF(author_name, ''), ?), last_updated = CURRENT_TIMESTAMP WHERE code = ?`,
+        [effectiveAuthor, beneficiaryCode]
+      );
+      const earliestPhoto = photos.length > 0 ? photos[photos.length - 1]?.created_at : undefined;
+      await writeProjectMeta(targetDir, {
+        beneficiaryCode,
+        originalCode: beneficiary?.original_code || beneficiaryCode,
+        authorName: effectiveAuthor,
+        createdAt: projectMeta?.createdAt || earliestPhoto || beneficiary?.last_updated,
+        updatedAt: new Date().toISOString(),
+      });
+      await loadData();
     } catch (error) { Alert.alert("Error", "Could not save notes."); }
   };
 
@@ -313,7 +404,12 @@ export default function BeneficiaryAlbumScreen() {
         try {
           const stampedUri = await viewShotRef.current?.capture?.();
           if (stampedUri) {
-             const filename = generatePhotoFilename(beneficiary?.serial_number, beneficiary?.name, beneficiaryCode, photos.length);
+             const filename = generatePhotoFilename(
+               beneficiary?.serial_number ?? '',
+               beneficiary?.name ?? '',
+               beneficiaryCode,
+               photos.length
+             );
              targetDir.create({ intermediates: true, idempotent: true });
              const destPhoto = new File(targetDir, filename);
              if (destPhoto.exists) {
@@ -321,8 +417,24 @@ export default function BeneficiaryAlbumScreen() {
              }
              new File(stampedUri).copy(destPhoto);
              const newUri = destPhoto.uri;
-             await db.runAsync(`INSERT INTO photos (id, beneficiary_code, local_uri, filename, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?)`,
-               [captureQueue[0].id.toString(), beneficiaryCode, newUri, filename, captureQueue[0].geoData.lat, captureQueue[0].geoData.lon]);
+             const effectiveAuthor = beneficiary?.author_name?.trim() || currentAuthorName;
+             const nowIso = new Date().toISOString();
+             await db.runAsync(
+               `INSERT INTO photos (id, beneficiary_code, local_uri, filename, latitude, longitude, author_name) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+               [captureQueue[0].id.toString(), beneficiaryCode, newUri, filename, captureQueue[0].geoData.lat, captureQueue[0].geoData.lon, effectiveAuthor]
+             );
+             await db.runAsync(
+               `UPDATE beneficiaries SET author_name = COALESCE(NULLIF(author_name, ''), ?), last_updated = CURRENT_TIMESTAMP WHERE code = ?`,
+               [effectiveAuthor, beneficiaryCode]
+             );
+             const earliestPhoto = photos.length > 0 ? photos[photos.length - 1]?.created_at : nowIso;
+             await writeProjectMeta(targetDir, {
+               beneficiaryCode,
+               originalCode: beneficiary?.original_code || beneficiaryCode,
+               authorName: effectiveAuthor,
+               createdAt: projectMeta?.createdAt || earliestPhoto || beneficiary?.last_updated || nowIso,
+               updatedAt: nowIso,
+             });
              setImageRefreshKey(Date.now());
              loadData();
           }
@@ -430,7 +542,24 @@ export default function BeneficiaryAlbumScreen() {
         data={photos}
         numColumns={COLUMN_COUNT}
         keyExtractor={(item) => item.id}
-        ListHeaderComponent={<BeneficiaryHeader beneficiary={beneficiary} id={beneficiaryCode} photosCount={photos.length} />}
+        ListHeaderComponent={
+          <BeneficiaryHeader
+            beneficiary={beneficiary}
+            id={beneficiaryCode}
+            photosCount={photos.length}
+            authorDisplay={
+              beneficiary?.author_name?.trim() ||
+              projectMeta?.authorName?.trim() ||
+              photos[0]?.author_name?.trim() ||
+              currentAuthorName
+            }
+            originalDateDisplay={formatDisplayDateTime(
+              projectMeta?.createdAt ||
+              (photos.length > 0 ? photos[photos.length - 1]?.created_at : null) ||
+              beneficiary?.last_updated
+            )}
+          />
+        }
         ListFooterComponent={<BeneficiaryFooter noteContent={noteContent} setNoteContent={setNoteContent} isEditingNote={isEditingNote} setIsEditingNote={setIsEditingNote} saveNote={saveNote} />}
         contentContainerStyle={styles.listContent}
         columnWrapperStyle={{ paddingHorizontal: 15, justifyContent: 'space-between' }}
@@ -601,6 +730,39 @@ const styles = StyleSheet.create({
   detailItem: { alignItems: 'center' },
   gridLabel: { fontSize: 11, color: '#94A3B8', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 },
   gridValue: { fontSize: 14, color: '#334155', fontWeight: 'bold' },
+
+  authorInfoCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    marginHorizontal: 15,
+    marginBottom: 18,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    elevation: 1,
+  },
+  authorInfoRow: { flexDirection: 'row', alignItems: 'center' },
+  authorIconBadge: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#EFF6FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  authorInfoTextCol: { flex: 1 },
+  authorInfoLabel: {
+    fontSize: 11,
+    color: '#64748B',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginBottom: 2,
+  },
+  authorInfoValue: { fontSize: 15, color: '#1E293B', fontWeight: '700' },
+  authorInfoDivider: { height: 1, backgroundColor: '#F1F5F9', marginVertical: 10 },
   
   notesContainer: { marginHorizontal: 15, marginBottom: 25, marginTop: 10 },
   sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },

@@ -1,4 +1,5 @@
 import * as SQLite from 'expo-sqlite';
+import Constants from 'expo-constants';
 import { SEED_DATA, SEED_DATASET_TIMESTAMP } from './seedLoader';
 
 export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
@@ -26,6 +27,8 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
         inspection_status TEXT DEFAULT 'pending',
         sync_status TEXT DEFAULT 'pending',
         is_custom INTEGER DEFAULT 0,
+        author_name TEXT,
+        original_code TEXT,
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -42,6 +45,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
         latitude TEXT,
         longitude TEXT,
         notes TEXT,
+        author_name TEXT,
         sync_status TEXT DEFAULT 'local_only',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (beneficiary_code) REFERENCES beneficiaries (code) ON DELETE CASCADE
@@ -54,7 +58,7 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
     const existingColumns = await db.getAllAsync(`PRAGMA table_info(beneficiaries);`) as { name: string }[];
     const columnNames = existingColumns.map(c => c.name);
     
-    const alterQueries = [];
+    const alterQueries: string[] = [];
     if (!columnNames.includes('district_name')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN district_name TEXT;`);
     if (!columnNames.includes('city_name')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN city_name TEXT;`);
     if (!columnNames.includes('annexure_id')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN annexure_id TEXT;`);
@@ -63,9 +67,36 @@ export const initDatabase = async (db: SQLite.SQLiteDatabase) => {
     if (!columnNames.includes('site_address')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN site_address TEXT;`);
     if (!columnNames.includes('inspection_status')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN inspection_status TEXT DEFAULT 'pending';`);
     if (!columnNames.includes('is_custom')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN is_custom INTEGER DEFAULT 0;`);
+    if (!columnNames.includes('author_name')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN author_name TEXT;`);
+    if (!columnNames.includes('original_code')) alterQueries.push(`ALTER TABLE beneficiaries ADD COLUMN original_code TEXT;`);
+
+    const existingPhotoColumns = await db.getAllAsync(`PRAGMA table_info(photos);`) as { name: string }[];
+    const photoColumnNames = existingPhotoColumns.map(c => c.name);
+    if (!photoColumnNames.includes('author_name')) alterQueries.push(`ALTER TABLE photos ADD COLUMN author_name TEXT;`);
 
     for (const query of alterQueries) {
       try { await db.execAsync(query); } catch(e) {}
+    }
+
+    // Track installed/updated app version timestamp in app_metadata
+    try {
+      const currentAppVersion = Constants.expoConfig?.version || '1.0.0';
+      const storedVersion = await db.getFirstAsync<{ value: string }>(
+        `SELECT value FROM app_metadata WHERE key = 'installed_version'`
+      );
+      if (!storedVersion || storedVersion.value !== currentAppVersion) {
+        const nowIso = new Date().toISOString();
+        await db.runAsync(
+          `INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('installed_version', ?)`,
+          [currentAppVersion]
+        );
+        await db.runAsync(
+          `INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('app_version_updated_at', ?)`,
+          [nowIso]
+        );
+      }
+    } catch (versionErr) {
+      console.error('Failed to track app version metadata:', versionErr);
     }
 
     // NON-DESTRUCTIVE SEEDING: Preserves existing inspections, photos, and custom-added projects

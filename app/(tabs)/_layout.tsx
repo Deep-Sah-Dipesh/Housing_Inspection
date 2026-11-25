@@ -50,13 +50,13 @@ export default function TabLayout() {
         }}
       />
 
-      {/* Restored the missing Profile Tab */}
+      {/* Settings Tab */}
       <Tabs.Screen
         name="profile"
         options={{
-          title: 'Profile',
+          title: 'Settings',
           tabBarIcon: ({ color, size }) => (
-            <Ionicons name="person-circle-outline" size={size} color={color} />
+            <Ionicons name="settings-outline" size={size} color={color} />
           ),
         }}
       />
