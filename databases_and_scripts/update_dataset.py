@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from difflib import SequenceMatcher
 import json
 import re
 import shutil
@@ -234,6 +235,10 @@ def map_dataframe(
             record["project_name"] = default_project
 
         record["city_name"] = clean_city_name(record["city_name"])
+        if record["city_name"].upper().startswith(("HIMATNAGAR", "HIMMATNAGAR")):
+            record["city_name"] = "HIMMATNAGAR MUNICIPALITY"
+        if not record["district_name"] and "HIMMATNAGAR" in record["city_name"].upper():
+            record["district_name"] = "Sabar Kantha"
         records.append(record)
 
     return records, missing_code_rows, warnings
@@ -673,6 +678,85 @@ def run_incremental_updation(
                 previous_records = loaded
 
     reports = [parse_dataset_file(p) for p in pending_paths]
+
+    # Reconcile slightly different city/district spellings against existing DB values.
+    # For city_name, strip generic suffixes (e.g. MUNICIPALITY) and require same district_name
+    # so distinct towns like "DEHGAM MUNICIPALITY" and "DEESA MUNICIPALITY" are never merged.
+    def _strip_city_suffix(name: str) -> str:
+        return re.sub(
+            r"\b(municipality|nagar\s*palika|corporation|nagarpalika)\b",
+            "",
+            name.lower(),
+        ).strip()
+
+    existing_cities_by_district: dict[str, set[str]] = {}
+    existing_cities_all: set[str] = set()
+    existing_districts: set[str] = set()
+    for r in previous_records:
+        c = r.get("city_name", "").strip()
+        d = r.get("district_name", "").strip()
+        if c:
+            existing_cities_all.add(c)
+            existing_cities_by_district.setdefault(d.lower(), set()).add(c)
+        if d:
+            existing_districts.add(d)
+
+    spelling_decisions: dict[tuple[str, str, str], str] = {}
+
+    for report in reports:
+        for rec in report.records:
+            # First reconcile district_name, then city_name within that district
+            d_val = rec.get("district_name", "").strip()
+            if d_val and d_val not in existing_districts:
+                d_key = ("district_name", "", d_val)
+                if d_key in spelling_decisions:
+                    rec["district_name"] = spelling_decisions[d_key]
+                else:
+                    best_match, best_ratio = "", 0.0
+                    for ex in existing_districts:
+                        ratio = SequenceMatcher(None, d_val.lower(), ex.lower()).ratio()
+                        if ratio > best_ratio:
+                            best_ratio, best_match = ratio, ex
+                    if best_match and best_ratio >= 0.85:
+                        should_merge = yes
+                        if not yes and sys.stdin.isatty():
+                            ans = input(f"\nFound similar district_name '{d_val}' -> merge into existing '{best_match}'? [y/N]: ").strip().lower()
+                            should_merge = ans in {"y", "yes"}
+                        chosen = best_match if should_merge else d_val
+                    else:
+                        chosen = d_val
+                    spelling_decisions[d_key] = chosen
+                    rec["district_name"] = chosen
+
+            c_val = rec.get("city_name", "").strip()
+            d_norm = rec.get("district_name", "").strip().lower()
+            if not c_val or c_val in existing_cities_all:
+                continue
+            c_key = ("city_name", d_norm, c_val)
+            if c_key in spelling_decisions:
+                rec["city_name"] = spelling_decisions[c_key]
+                continue
+            candidates = existing_cities_by_district.get(d_norm, set()) if d_norm else existing_cities_all
+            c_core = _strip_city_suffix(c_val)
+            best_match, best_ratio = "", 0.0
+            for ex in candidates:
+                ex_core = _strip_city_suffix(ex)
+                if not c_core or not ex_core:
+                    continue
+                ratio = SequenceMatcher(None, c_core, ex_core).ratio()
+                if ratio > best_ratio:
+                    best_ratio, best_match = ratio, ex
+            if best_match and best_ratio >= 0.85:
+                should_merge = yes
+                if not yes and sys.stdin.isatty():
+                    ans = input(f"\nFound similar city_name '{c_val}' -> merge into existing '{best_match}'? [y/N]: ").strip().lower()
+                    should_merge = ans in {"y", "yes"}
+                chosen = best_match if should_merge else c_val
+            else:
+                chosen = c_val
+            spelling_decisions[c_key] = chosen
+            rec["city_name"] = chosen
+
     final_records, diff = merge_and_analyze(previous_records, reports)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

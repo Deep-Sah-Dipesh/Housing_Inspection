@@ -1,7 +1,8 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Modal,
   ScrollView,
   StyleSheet,
@@ -19,9 +20,16 @@ import * as Sharing from 'expo-sharing';
 import { Directory, File } from 'expo-file-system';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import { useAppStore } from '../../store/appStore';
-import { formatAgentName, formatDisplayDateTime } from '../../utils/authorHelpers';
+import {
+  deriveAuthorId,
+  formatDateAndTimeParts,
+  formatEtaRemaining,
+  resolveAuthorName,
+} from '../../utils/authorHelpers';
 import { createFullBackup, restoreFullBackup } from '../../utils/backupHelpers';
+import { auth, ensureGoogleSignInConfigured, signOut } from '../../utils/firebaseConfig';
 
 const PLAY_STORE_MARKET_URL = 'market://details?id=com.deepsah.housinginspection';
 const PLAY_STORE_WEB_URL =
@@ -31,9 +39,21 @@ export default function SettingsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const db = useSQLiteContext();
-  const { userId, userName, officialName, setOfficialName, logout } = useAppStore();
+  const {
+    userId,
+    authorId,
+    userName,
+    officialName,
+    officialNameLocked,
+    setOfficialName,
+    lockOfficialName,
+    logout,
+  } = useAppStore();
 
+  const { currentlyRunning } = Updates.useUpdates();
   const appVersion = Constants.expoConfig?.version || '1.0.0';
+  const rawUpdateId = currentlyRunning?.updateId || Updates.updateId;
+  const updateIdDisplay = rawUpdateId ? rawUpdateId.slice(0, 8) : 'Embedded';
   const appVariant =
     Updates.channel === 'production'
       ? 'Play Store'
@@ -41,15 +61,41 @@ export default function SettingsScreen() {
       ? 'Preview'
       : 'Development';
 
-  const formattedAgentName = formatAgentName(userName);
+  const resolvedAuthorId = authorId || deriveAuthorId(userId);
+  const displayAgentName = resolveAuthorName(officialName, userName);
 
   const [versionUpdatedAt, setVersionUpdatedAt] = useState<string | null>(null);
   const [showOfficialNameModal, setShowOfficialNameModal] = useState(false);
   const [officialNameInput, setOfficialNameInput] = useState('');
+  const [modalActionMode, setModalActionMode] = useState<'edit_only' | 'lock_and_backup'>('edit_only');
 
   const [isBusy, setIsBusy] = useState(false);
+  const [busyTitle, setBusyTitle] = useState('Processing...');
   const [busyMessage, setBusyMessage] = useState('');
   const [busyPercent, setBusyPercent] = useState(0);
+  const [etaText, setEtaText] = useState('Calculating remaining time...');
+
+  const operationStartRef = useRef<number>(Date.now());
+  const progressAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(progressAnim, {
+      toValue: Math.min(100, Math.max(0, busyPercent)),
+      duration: 240,
+      useNativeDriver: false,
+    }).start();
+  }, [busyPercent, progressAnim]);
+
+  useEffect(() => {
+    if (!isBusy) return;
+    const updateEta = () => {
+      const elapsed = Date.now() - operationStartRef.current;
+      setEtaText(formatEtaRemaining(elapsed, busyPercent));
+    };
+    updateEta();
+    const timer = setInterval(updateEta, 500);
+    return () => clearInterval(timer);
+  }, [isBusy, busyPercent]);
 
   useFocusEffect(
     useCallback(() => {
@@ -75,13 +121,22 @@ export default function SettingsScreen() {
   const handleLogout = () => {
     Alert.alert(
       'Secure Logout',
-      'Are you sure you want to log out? You will need your credentials to log back in.',
+      'Are you sure you want to log out? You will need to sign in with Google again.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Logout',
           style: 'destructive',
-          onPress: () => {
+          onPress: async () => {
+            try {
+              ensureGoogleSignInConfigured();
+              if (GoogleSignin.hasPreviousSignIn()) {
+                await GoogleSignin.signOut();
+              }
+            } catch {}
+            try {
+              await signOut(auth);
+            } catch {}
             logout();
             router.replace('/');
           },
@@ -90,15 +145,34 @@ export default function SettingsScreen() {
     );
   };
 
+  const openEditNameModal = (mode: 'edit_only' | 'lock_and_backup') => {
+    if (officialNameLocked) return;
+    setModalActionMode(mode);
+    setOfficialNameInput(officialName || displayAgentName || '');
+    setShowOfficialNameModal(true);
+  };
+
   const executeBackupWithAuthor = async (authorToUse: string) => {
-    setIsBusy(true);
+    operationStartRef.current = Date.now();
+    progressAnim.setValue(0);
+    setBusyTitle('Creating Full Backup');
     setBusyMessage('Preparing full backup...');
-    setBusyPercent(0);
+    setBusyPercent(2);
+    setEtaText('Calculating remaining time...');
+    setIsBusy(true);
+
     try {
-      const result = await createFullBackup(db, authorToUse, (msg, pct) => {
-        setBusyMessage(msg);
-        setBusyPercent(pct);
-      });
+      const result = await createFullBackup(
+        db,
+        authorToUse,
+        (msg, pct) => {
+          setBusyMessage(msg);
+          setBusyPercent(pct);
+          const elapsed = Date.now() - operationStartRef.current;
+          setEtaText(formatEtaRemaining(elapsed, pct));
+        },
+        resolvedAuthorId
+      );
       setIsBusy(false);
 
       Alert.alert(
@@ -142,21 +216,21 @@ export default function SettingsScreen() {
   };
 
   const handleConfirmAuthorAndBackup = () => {
-    if (officialName && officialName.trim().length > 0) {
+    const activeName = (officialName || displayAgentName).trim();
+    if (officialNameLocked && activeName) {
       Alert.alert(
         'Confirm Backup Signature',
-        `This backup will be permanently signed with your locked Official Name:\n\n"${officialName}"\n\nProceed with creating the backup?`,
+        `This backup will be signed with your locked Official Name:\n\n"${activeName}"\n\nProceed with creating the backup?`,
         [
           { text: 'Cancel', style: 'cancel' },
           {
             text: 'Sign & Create Backup',
-            onPress: () => executeBackupWithAuthor(officialName),
+            onPress: () => executeBackupWithAuthor(activeName),
           },
         ]
       );
     } else {
-      setOfficialNameInput('');
-      setShowOfficialNameModal(true);
+      openEditNameModal('lock_and_backup');
     }
   };
 
@@ -174,25 +248,36 @@ export default function SettingsScreen() {
     );
   };
 
-  const handleLockOfficialNameAndBackup = async () => {
+  const handleConfirmOfficialName = async () => {
     const trimmed = officialNameInput.trim();
     if (!trimmed) {
       Alert.alert('Required', 'Please enter your Full Official Name.');
       return;
     }
-    setOfficialName(trimmed);
+    setOfficialName(trimmed, true);
+    lockOfficialName();
     setShowOfficialNameModal(false);
-    await executeBackupWithAuthor(trimmed);
+
+    if (modalActionMode === 'lock_and_backup') {
+      await executeBackupWithAuthor(trimmed);
+    }
   };
 
   const handleRestoreBackup = async () => {
-    setIsBusy(true);
+    operationStartRef.current = Date.now();
+    progressAnim.setValue(0);
+    setBusyTitle('Restoring Backup');
     setBusyMessage('Select a backup .zip file...');
-    setBusyPercent(5);
+    setBusyPercent(2);
+    setEtaText('Calculating remaining time...');
+    setIsBusy(true);
+
     try {
       const summary = await restoreFullBackup(db, (msg, pct) => {
         setBusyMessage(msg);
         setBusyPercent(pct);
+        const elapsed = Date.now() - operationStartRef.current;
+        setEtaText(formatEtaRemaining(elapsed, pct));
       });
       setIsBusy(false);
       if (!summary) {
@@ -230,6 +315,12 @@ export default function SettingsScreen() {
     }
   };
 
+  const updatedParts = formatDateAndTimeParts(versionUpdatedAt);
+  const animatedWidth = progressAnim.interpolate({
+    inputRange: [0, 100],
+    outputRange: ['0%', '100%'],
+  });
+
   return (
     <ScrollView
       style={[styles.container, { paddingTop: insets.top }]}
@@ -241,21 +332,33 @@ export default function SettingsScreen() {
 
       {/* 1. Agent Profile Section */}
       <View style={styles.section}>
-        <Text style={styles.sectionLabel}>AGENT PROFILE</Text>
+        <Text style={styles.sectionLabel}>Agent Profile</Text>
         <View style={styles.card}>
           <View style={styles.profileHeaderRow}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.agentName}>{formattedAgentName}</Text>
+            <View style={{ flex: 1, marginRight: 10 }}>
+              <Text style={styles.agentName}>{displayAgentName}</Text>
               {userId ? <Text style={styles.agentSubId}>{userId}</Text> : null}
+              {resolvedAuthorId ? (
+                <Text style={styles.agentAuthorId}>Author ID: {resolvedAuthorId}</Text>
+              ) : null}
             </View>
+            {!officialNameLocked && (
+              <TouchableOpacity
+                style={styles.editNameBtn}
+                onPress={() => openEditNameModal('edit_only')}
+                activeOpacity={0.8}
+              >
+                <Ionicons name="pencil" size={18} color="#2563EB" />
+              </TouchableOpacity>
+            )}
           </View>
 
-          {officialName ? (
+          {officialNameLocked ? (
             <View style={styles.lockedNameBadge}>
               <Ionicons name="lock-closed" size={15} color="#1D4ED8" style={{ marginRight: 8 }} />
               <View style={{ flex: 1 }}>
                 <Text style={styles.lockedNameCaption}>Locked Official Name</Text>
-                <Text style={styles.lockedNameValue}>{officialName}</Text>
+                <Text style={styles.lockedNameValue}>{officialName || displayAgentName}</Text>
               </View>
             </View>
           ) : (
@@ -267,7 +370,8 @@ export default function SettingsScreen() {
                 style={{ marginRight: 8 }}
               />
               <Text style={styles.unlockedNoticeText}>
-                Official Name will be locked when you create your first backup.
+                Your Official Name will be locked permanently once edited here or when creating your
+                first backup.
               </Text>
             </View>
           )}
@@ -283,7 +387,7 @@ export default function SettingsScreen() {
 
       {/* 2. Backup & Restore Section */}
       <View style={styles.section}>
-        <Text style={styles.sectionLabel}>BACKUP & RESTORE</Text>
+        <Text style={styles.sectionLabel}>Backup & Restore</Text>
         <View style={styles.card}>
           <Text style={styles.sectionDescription}>
             Export a tamper-resistant archive of all inspected projects, photos, notes, and author
@@ -312,7 +416,7 @@ export default function SettingsScreen() {
 
       {/* 3. App Information Section */}
       <View style={styles.section}>
-        <Text style={styles.sectionLabel}>APP INFORMATION</Text>
+        <Text style={styles.sectionLabel}>App Information</Text>
         <View style={styles.card}>
           <View style={styles.infoRow}>
             <Text style={styles.infoKey}>App Version</Text>
@@ -320,13 +424,24 @@ export default function SettingsScreen() {
           </View>
           <View style={styles.rowDivider} />
           <View style={styles.infoRow}>
+            <Text style={styles.infoKey}>Update ID</Text>
+            <Text style={styles.infoVal}>{updateIdDisplay}</Text>
+          </View>
+          <View style={styles.rowDivider} />
+          <View style={styles.infoRow}>
             <Text style={styles.infoKey}>Variant</Text>
             <Text style={styles.infoVal}>{appVariant}</Text>
           </View>
           <View style={styles.rowDivider} />
-          <View style={styles.infoRow}>
-            <Text style={styles.infoKey}>Install / Last Updated</Text>
-            <Text style={styles.infoVal}>{formatDisplayDateTime(versionUpdatedAt)}</Text>
+          <View style={styles.twoLineInfoRow}>
+            <View style={styles.twoLineKeyCol}>
+              <Text style={styles.infoKey}>Last Updated</Text>
+              <Text style={styles.infoKeySub}>or Installed</Text>
+            </View>
+            <View style={styles.twoLineValCol}>
+              <Text style={styles.infoVal}>{updatedParts.date}</Text>
+              <Text style={styles.infoValSub}>{updatedParts.time}</Text>
+            </View>
           </View>
 
           <View style={styles.divider} />
@@ -342,18 +457,27 @@ export default function SettingsScreen() {
         </View>
       </View>
 
-      {/* Official Name Lock Modal */}
-      <Modal visible={showOfficialNameModal} transparent animationType="fade">
+      {/* Official Name Edit & Permanent Lock Modal */}
+      <Modal
+        visible={showOfficialNameModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowOfficialNameModal(false)}
+      >
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <View style={styles.modalHeaderRow}>
               <Ionicons name="shield-checkmark" size={24} color="#2563EB" style={{ marginRight: 10 }} />
-              <Text style={styles.modalTitle}>Set Official Author Name</Text>
+              <Text style={styles.modalTitle}>Set Official Name</Text>
             </View>
-            <Text style={styles.modalWarningText}>
-              Enter your Full Official Name to sign your inspection reports and backups. Once set,
-              this name is permanently locked and cannot be changed later.
-            </Text>
+            <View style={styles.oneTimeWarningBox}>
+              <Ionicons name="warning-outline" size={18} color="#B45309" style={{ marginRight: 8, marginTop: 1 }} />
+              <Text style={styles.oneTimeWarningText}>
+                This name can only be changed <Text style={{ fontWeight: '800' }}>once</Text> and{' '}
+                <Text style={{ fontWeight: '800' }}>cannot be undone</Text>. Once saved, it is
+                permanently locked for all reports and backups.
+              </Text>
+            </View>
             <TextInput
               style={styles.modalInput}
               placeholder="e.g., Rajesh Kumar Sharma"
@@ -372,24 +496,30 @@ export default function SettingsScreen() {
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.modalConfirmBtn}
-                onPress={handleLockOfficialNameAndBackup}
+                onPress={handleConfirmOfficialName}
               >
-                <Text style={styles.modalConfirmText}>Lock & Backup</Text>
+                <Text style={styles.modalConfirmText}>
+                  {modalActionMode === 'lock_and_backup' ? 'Lock & Backup' : 'Save & Lock'}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
 
-      {/* Progress Modal */}
-      <Modal visible={isBusy} transparent animationType="fade">
+      {/* Progress Modal with Smooth Bar & ETA */}
+      <Modal visible={isBusy} transparent animationType="fade" onRequestClose={() => {}}>
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
-            <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 14 }} />
+            <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 10 }} />
+            <Text style={styles.progressTitle}>{busyTitle}</Text>
             <View style={styles.progressBarBg}>
-              <View style={[styles.progressBarFill, { width: `${busyPercent}%` }]} />
+              <Animated.View style={[styles.progressBarFill, { width: animatedWidth }]} />
             </View>
-            <Text style={styles.progressPercent}>{busyPercent}%</Text>
+            <View style={styles.progressMetaRow}>
+              <Text style={styles.progressPercent}>{busyPercent}%</Text>
+              <Text style={styles.progressEta}>{etaText}</Text>
+            </View>
             <Text style={styles.progressMsg}>{busyMessage}</Text>
           </View>
         </View>
@@ -406,12 +536,13 @@ const styles = StyleSheet.create({
 
   section: { marginHorizontal: 20, marginBottom: 22 },
   sectionLabel: {
-    fontSize: 12,
+    fontSize: 14.5,
     fontWeight: '800',
-    color: '#64748B',
-    letterSpacing: 0.8,
-    marginBottom: 8,
-    marginLeft: 4,
+    color: '#475569',
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+    textAlign: 'center',
+    marginBottom: 10,
   },
   card: {
     backgroundColor: '#FFFFFF',
@@ -423,8 +554,19 @@ const styles = StyleSheet.create({
   },
 
   profileHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
-  agentName: { fontSize: 22, fontWeight: '800', color: '#0F172A' },
+  agentName: { fontSize: 21, fontWeight: '800', color: '#0F172A' },
   agentSubId: { fontSize: 13, color: '#64748B', marginTop: 2, fontWeight: '500' },
+  agentAuthorId: { fontSize: 12, color: '#2563EB', marginTop: 3, fontWeight: '700' },
+  editNameBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
 
   lockedNameBadge: {
     flexDirection: 'row',
@@ -489,7 +631,12 @@ const styles = StyleSheet.create({
 
   infoRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   infoKey: { fontSize: 14, color: '#64748B', fontWeight: '600' },
+  infoKeySub: { fontSize: 13, color: '#64748B', fontWeight: '600', marginTop: 2 },
   infoVal: { fontSize: 14, color: '#0F172A', fontWeight: '700' },
+  infoValSub: { fontSize: 13, color: '#475569', fontWeight: '600', marginTop: 2 },
+  twoLineInfoRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
+  twoLineKeyCol: { flexShrink: 1, paddingRight: 12 },
+  twoLineValCol: { alignItems: 'flex-end', flexShrink: 1 },
   updateBtn: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -516,9 +663,19 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 400,
   },
-  modalHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  modalHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
   modalTitle: { fontSize: 18, fontWeight: '800', color: '#0F172A' },
-  modalWarningText: { fontSize: 13, color: '#475569', lineHeight: 19, marginBottom: 16 },
+  oneTimeWarningBox: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: '#FFFBEB',
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    borderRadius: 10,
+    padding: 11,
+    marginBottom: 14,
+  },
+  oneTimeWarningText: { flex: 1, fontSize: 12.5, color: '#92400E', lineHeight: 18 },
   modalInput: {
     backgroundColor: '#F8FAFC',
     borderWidth: 1,
@@ -549,11 +706,12 @@ const styles = StyleSheet.create({
   progressCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
-    padding: 26,
-    width: '85%',
-    maxWidth: 340,
+    padding: 24,
+    width: '88%',
+    maxWidth: 360,
     alignItems: 'center',
   },
+  progressTitle: { fontSize: 16, fontWeight: '800', color: '#0F172A', marginBottom: 14 },
   progressBarBg: {
     width: '100%',
     height: 10,
@@ -562,7 +720,15 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     marginBottom: 10,
   },
-  progressBarFill: { height: '100%', backgroundColor: '#2563EB' },
-  progressPercent: { fontSize: 15, fontWeight: '800', color: '#2563EB', marginBottom: 4 },
+  progressBarFill: { height: '100%', backgroundColor: '#2563EB', borderRadius: 5 },
+  progressMetaRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: 8,
+  },
+  progressPercent: { fontSize: 14, fontWeight: '800', color: '#2563EB' },
+  progressEta: { fontSize: 12.5, fontWeight: '600', color: '#64748B' },
   progressMsg: { fontSize: 13, color: '#475569', textAlign: 'center' },
 });

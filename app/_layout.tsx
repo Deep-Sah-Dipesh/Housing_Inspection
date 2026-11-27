@@ -1,21 +1,64 @@
 import React, { Component, ReactNode, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, ActivityIndicator, Image, Modal, TouchableOpacity, StyleSheet, Alert, AppState } from 'react-native';
 import { Stack } from 'expo-router';
-import { SQLiteProvider } from 'expo-sqlite';
+import { SQLiteProvider, useSQLiteContext } from 'expo-sqlite';
 import * as Updates from 'expo-updates';
 import Constants from 'expo-constants';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
-import { initDatabase } from '../utils/database';
+import { initDatabase, syncSeedDatasetInBackground } from '../utils/database';
+import { useAppStore } from '../store/appStore';
 
 interface UpdateManifestExtra {
   id?: string;
+  createdAt?: string;
+  metadata?: {
+    message?: string;
+    releaseNotes?: string;
+    description?: string;
+    updateMessage?: string;
+  };
   extra?: {
+    message?: string;
+    updateMessage?: string;
     expoClient?: {
       version?: string;
+      description?: string;
+      extra?: {
+        updateMessage?: string;
+      };
     };
   };
 }
+
+const formatShortUpdateId = (id?: string | null): string => {
+  if (!id) return '';
+  const compact = id.replace(/[^a-zA-Z0-9]/g, '');
+  if (compact.length <= 6) return compact;
+  return `${compact.slice(0, 2)}..${compact.slice(-4)}`;
+};
+
+const extractUpdateNotes = (manifest: UpdateManifestExtra | undefined): string => {
+  if (!manifest) {
+    return 'Includes latest dataset updates, performance improvements, and bug fixes.';
+  }
+  const candidates = [
+    manifest.metadata?.message,
+    manifest.metadata?.releaseNotes,
+    manifest.metadata?.description,
+    manifest.metadata?.updateMessage,
+    manifest.extra?.updateMessage,
+    manifest.extra?.message,
+    manifest.extra?.expoClient?.extra?.updateMessage,
+    manifest.extra?.expoClient?.description,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return 'Includes latest dataset updates, performance improvements, and bug fixes.';
+};
 
 class SQLiteErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: string }> {
   state = { hasError: false, error: '' };
@@ -48,13 +91,43 @@ class SQLiteErrorBoundary extends Component<{ children: ReactNode }, { hasError:
   }
 }
 
+function BackgroundSeedSync() {
+  const db = useSQLiteContext();
+  const setSeedSyncing = useAppStore((s) => s.setSeedSyncing);
+  const bumpSeedSyncVersion = useAppStore((s) => s.bumpSeedSyncVersion);
+
+  useEffect(() => {
+    let active = true;
+    setSeedSyncing(true);
+    syncSeedDatasetInBackground(db)
+      .then((updated) => {
+        if (active && updated) {
+          bumpSeedSyncVersion();
+        }
+      })
+      .catch((err) => {
+        console.error('Background seed sync error:', err);
+      })
+      .finally(() => {
+        if (active) setSeedSyncing(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [db, setSeedSyncing, bumpSeedSyncVersion]);
+
+  return null;
+}
+
 export default function RootLayout() {
   const { downloadProgress, isDownloading, currentlyRunning } = Updates.useUpdates();
   const currentVersion = Constants.expoConfig?.version || '2.2.0';
-  const currentShortId = currentlyRunning?.updateId ? currentlyRunning.updateId.slice(0, 6) : '';
+  const currentShortId = formatShortUpdateId(currentlyRunning?.updateId);
 
-  const [isReady, setIsReady] = useState(false);
-  const [updateMessage, setUpdateMessage] = useState('Initializing Secure Workspace...');
+  const [isReady, setIsReady] = useState(true);
+  const [updateMessage, setUpdateMessage] = useState('Initializing Workspace...');
+  const [otaReleaseNotes, setOtaReleaseNotes] = useState<string | null>(null);
   const [targetVersionLabel, setTargetVersionLabel] = useState<string | null>(null);
   const [showUpdatePrompt, setShowUpdatePrompt] = useState(false);
 
@@ -73,16 +146,25 @@ export default function RootLayout() {
       if (update.isAvailable) {
         const manifest = update.manifest as UpdateManifestExtra | undefined;
         const nextId = manifest?.id || 'latest';
+        if (currentlyRunning?.updateId && manifest?.id && manifest.id === currentlyRunning.updateId) {
+          return false;
+        }
         if (!isInitialLaunch && dismissedUpdateIdRef.current === nextId) {
           return false;
         }
         const nextAppVer = manifest?.extra?.expoClient?.version || currentVersion;
-        const nextShortId = manifest?.id ? manifest.id.slice(0, 6) : 'Latest';
+        const nextShortId = formatShortUpdateId(manifest?.id) || 'Latest';
         const nextLabel =
-          nextAppVer !== currentVersion ? `v${nextAppVer}` : `v${nextAppVer} (${nextShortId})`;
+          nextAppVer !== currentVersion
+            ? `v${nextAppVer}`
+            : nextShortId !== currentShortId
+              ? `v${nextAppVer} (${nextShortId})`
+              : `v${nextAppVer} (New)`;
+        const releaseNotes = extractUpdateNotes(manifest);
 
         availableUpdateIdRef.current = nextId;
         setTargetVersionLabel(nextLabel);
+        setOtaReleaseNotes(releaseNotes);
         if (isInitialLaunch) {
           setUpdateMessage('A new update is available.');
         }
@@ -100,22 +182,7 @@ export default function RootLayout() {
   }, [currentVersion]);
 
   useEffect(() => {
-    let isMounted = true;
-
-    async function prepareApp() {
-      const promptShown = await checkForOtaUpdate(true);
-      if (isMounted && !promptShown) {
-        setUpdateMessage('Starting Workspace...');
-        setTimeout(() => {
-          if (isMounted) setIsReady(true);
-        }, 450);
-      }
-    }
-
-    prepareApp();
-    return () => {
-      isMounted = false;
-    };
+    checkForOtaUpdate(false);
   }, [checkForOtaUpdate]);
 
   useEffect(() => {
@@ -165,7 +232,7 @@ export default function RootLayout() {
   const progressPct = Math.round((downloadProgress ?? 0) * 100);
 
   const renderUpdateModal = () => (
-    <Modal visible={showUpdatePrompt} transparent animationType="fade">
+    <Modal visible={showUpdatePrompt} transparent animationType="fade" onRequestClose={handleUpdateNextLaunch}>
       <View style={styles.modalOverlay}>
         <View style={styles.updateDialog}>
           <View style={styles.dialogIconCircle}>
@@ -183,13 +250,27 @@ export default function RootLayout() {
             A newer version is available. Would you like to download and install it now, or update on your next launch?
           </Text>
 
+          {otaReleaseNotes && (
+            <View style={styles.releaseNotesBox}>
+              <Text style={styles.releaseNotesHeading}>What's New</Text>
+              <Text style={styles.releaseNotesText}>{otaReleaseNotes}</Text>
+            </View>
+          )}
+
           <TouchableOpacity style={styles.primaryUpdateBtn} onPress={handleUpdateNow}>
             <Ionicons name="refresh" size={18} color="#FFFFFF" style={{ marginRight: 8 }} />
             <Text style={styles.primaryUpdateBtnText}>Update Now</Text>
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.secondaryUpdateBtn} onPress={handleUpdateNextLaunch}>
-            <Text style={styles.secondaryUpdateBtnText}>Update on Next Launch</Text>
+            <Text
+              style={styles.secondaryUpdateBtnText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.85}
+            >
+              Update on Next Launch
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -232,6 +313,13 @@ export default function RootLayout() {
           )}
 
           <Text style={styles.statusMessage}>{message}</Text>
+
+          {otaReleaseNotes && (
+            <View style={[styles.releaseNotesBox, { marginTop: 16, maxWidth: 320 }]}>
+              <Text style={styles.releaseNotesHeading}>Update Notes</Text>
+              <Text style={styles.releaseNotesText}>{otaReleaseNotes}</Text>
+            </View>
+          )}
         </View>
 
         <View style={styles.developerFooter}>
@@ -258,8 +346,9 @@ export default function RootLayout() {
     <View style={{ flex: 1, backgroundColor: '#F8FAFC' }}>
       <StatusBar style="dark" />
       <SQLiteErrorBoundary>
-        <Suspense fallback={renderLoadingScreen('Syncing workspace database...')}>
+        <Suspense fallback={<View style={{ flex: 1, backgroundColor: '#F8FAFC' }} />}>
           <SQLiteProvider databaseName="housing.db" onInit={initDatabase} useSuspense>
+            <BackgroundSeedSync />
             <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: '#F8FAFC' } }}>
               <Stack.Screen name="index" />
               <Stack.Screen name="(tabs)" options={{ gestureEnabled: false }} />
@@ -377,9 +466,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   developerLogo: {
-    width: 32,
-    height: 32,
-    marginRight: 8,
+    width: 40,
+    height: 40,
+    marginRight: 10,
   },
   developerName: {
     fontSize: 15,
@@ -424,7 +513,32 @@ const styles = StyleSheet.create({
     color: '#475569',
     textAlign: 'center',
     lineHeight: 20,
-    marginBottom: 22,
+    marginBottom: 14,
+  },
+  releaseNotesBox: {
+    width: '100%',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 18,
+  },
+  releaseNotesHeading: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#2563EB',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  releaseNotesText: {
+    fontSize: 13,
+    color: '#334155',
+    lineHeight: 18,
+    textAlign: 'center',
   },
   primaryUpdateBtn: {
     flexDirection: 'row',

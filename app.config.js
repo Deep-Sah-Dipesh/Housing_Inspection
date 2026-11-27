@@ -1,11 +1,50 @@
 import fs from "fs";
 
+const VARIANT =
+  process.env.APP_VARIANT ||
+  process.env.EAS_BUILD_PROFILE ||
+  "production";
+
+const isDev = VARIANT === "development";
+const isPreview = VARIANT === "preview";
+
+const APP_NAME = isDev
+  ? "Housing Dev"
+  : isPreview
+  ? "Housing Pre"
+  : "Housing Inspection";
+
+const ANDROID_PACKAGE = isDev
+  ? "com.deepsah.housinginspection.dev"
+  : isPreview
+  ? "com.deepsah.housinginspection.preview"
+  : "com.deepsah.housinginspection";
+
+const resolveGoogleServicesFile = () => {
+  const filePath =
+    process.env.GOOGLE_SERVICES_JSON ||
+    (fs.existsSync("./google-services.json") ? "./google-services.json" : undefined);
+  if (!filePath || !fs.existsSync(filePath)) {
+    return undefined;
+  }
+  const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  const hasMatchingClient = (raw.client || []).some(
+    (c) => c?.client_info?.android_client_info?.package_name === ANDROID_PACKAGE
+  );
+  if (!hasMatchingClient) {
+    throw new Error(
+      `Google services file (${filePath}) is missing an Android client for package "${ANDROID_PACKAGE}".`
+    );
+  }
+  return filePath;
+};
+
 export default {
   expo: {
-    name: "Housing Inspection",
+    name: APP_NAME,
     slug: "Housing_Inspection",
-    scheme: "com.deepsah.housinginspection",
-    version: "2.2.0",
+    scheme: ANDROID_PACKAGE,
+    version: "2.2.4",
     orientation: "portrait",
     icon: "./assets/Housing_Inspection_Logo.png",
     userInterfaceStyle: "light",
@@ -34,12 +73,10 @@ export default {
         backgroundImage: "./assets/android-icon-background.png",
         monochromeImage: "./assets/android-icon-monochrome.png",
       },
-      package: "com.deepsah.housinginspection",
+      package: ANDROID_PACKAGE,
 
       // <-- This is the important change
-      googleServicesFile:
-        process.env.GOOGLE_SERVICES_JSON ||
-        (fs.existsSync("./google-services.json") ? "./google-services.json" : undefined),
+      googleServicesFile: resolveGoogleServicesFile(),
 
       permissions: [
         "android.permission.CAMERA",
@@ -62,8 +99,8 @@ export default {
       [
         "expo-splash-screen",
         {
-          image: "./assets/Logo_Deep_sah.png",
-          imageWidth: 250,
+          image: "./assets/Logo_Deep_sah_splash.png",
+          imageWidth: 260,
           resizeMode: "contain",
           backgroundColor: "#ffffff",
         },
@@ -77,6 +114,9 @@ export default {
       eas: {
         projectId: "ffe75714-4533-4d6f-927e-9a679e0a8db3",
       },
+      updateMessage:
+        process.env.EXPO_PUBLIC_UPDATE_MESSAGE ||
+        "Non-blocking background database sync, Sabar Kantha / Himmatnagar Municipality dataset fix, and empty-share protection.",
     },
 
     owner: "deep_sah",

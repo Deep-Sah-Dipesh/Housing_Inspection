@@ -1,5 +1,5 @@
-import React, { useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, ScrollView, TouchableWithoutFeedback } from 'react-native';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, SectionList, ActivityIndicator, Alert, Modal, TextInput, ScrollView, TouchableWithoutFeedback, BackHandler, RefreshControl } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useFocusEffect, useRouter } from 'expo-router';
@@ -8,8 +8,11 @@ import * as Sharing from 'expo-sharing';
 import { Directory, File, Paths } from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as IntentLauncher from 'expo-intent-launcher';
-import { generateZipArchive } from '../../utils/fileHelpers';
+import { generateZipArchive, shareProjectsZipArchive } from '../../utils/fileHelpers';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useAppStore } from '../../store/appStore';
+import { isOwnedByCurrentUser } from '../../utils/authorHelpers';
+import { deleteProjectFromDevice } from '../../utils/database';
 
 export interface BeneficiaryItem {
   code: string;
@@ -17,6 +20,7 @@ export interface BeneficiaryItem {
   name: string;
   district_name: string;
   city_name: string;
+  author_id?: string | null;
   author_name?: string | null;
   photo_count: number;
   sync_status: string;
@@ -38,7 +42,7 @@ const getShortSortName = (sort: SortMode) => {
 
 const toTitleCase = (str?: string | null) => {
   if (!str) return 'N/A';
-  let cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  const cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
   return cleanStr.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase());
 };
 
@@ -47,11 +51,28 @@ const getFirstWord = (str?: string | null) => {
   return str.split(/[\s,]+/)[0].replace(/[^a-zA-Z0-9]/g, '');
 };
 
+const parseSafeDate = (raw?: string | null): Date => {
+  if (!raw) return new Date(0);
+  const normalized = raw.includes('T') || raw.includes('Z') ? raw : raw.replace(' ', 'T') + 'Z';
+  const d = new Date(normalized);
+  if (!isNaN(d.getTime())) return d;
+  const fallback = new Date(raw);
+  return isNaN(fallback.getTime()) ? new Date(0) : fallback;
+};
+
 export default function DashboardScreen() {
   const db = useSQLiteContext();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  
+  const { userId, authorId, userName, officialName, seedSyncVersion } = useAppStore();
+
+  const ownershipCtx = {
+    currentAuthorId: authorId,
+    currentUserId: userId,
+    currentOfficialName: officialName,
+    currentUserName: userName,
+  };
+
   const [dashDistrict, setDashDistrict] = useState<string | null>(null);
   const [dashCity, setDashCity] = useState<string | null>(null);
   
@@ -60,6 +81,9 @@ export default function DashboardScreen() {
   const hasAutoExpanded = useRef(false);
 
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
   
   const [sortMode, setSortMode] = useState<SortMode>('Recently Inspected');
@@ -96,7 +120,7 @@ export default function DashboardScreen() {
 
       let cityQuery = `SELECT DISTINCT city_name FROM beneficiaries WHERE city_name IS NOT NULL AND city_name != ''`;
       const cityParams: string[] = [];
-      if (dashDistrict) { cityQuery += ` AND district_name = ?`; cityParams.push(dashDistrict); }
+      if (dashDistrict) { cityQuery += ` AND LOWER(TRIM(district_name)) = LOWER(TRIM(?))`; cityParams.push(dashDistrict); }
       cityQuery += ` ORDER BY city_name ASC`;
       const cits = await db.getAllAsync<{city_name: string}>(cityQuery, cityParams);
       setUniqueCities(cits.map(c => c.city_name));
@@ -113,15 +137,28 @@ export default function DashboardScreen() {
         ...(authorsList.includes('Unassigned') ? ['Unassigned'] : []),
       ];
       setUniqueAuthors(sortedAuthors);
-    } catch (error) {}
+    } catch {}
   }, [db, dashDistrict]);
 
   const loadGroupedBeneficiaries = useCallback(async () => {
-    setIsLoading(true);
+    if (!hasLoadedOnceRef.current) {
+      setIsLoading(true);
+    }
     try {
       let query = `
         SELECT b.code, b.original_code, b.name, b.district_name, b.city_name,
-               COALESCE(NULLIF(TRIM(b.author_name), ''), NULLIF(TRIM(MAX(p.author_name)), ''), 'Unassigned') as author_name,
+               COALESCE(
+                 NULLIF(TRIM((SELECT r.author_id FROM reports r WHERE r.beneficiary_code = b.code ORDER BY r.created_at DESC LIMIT 1)), ''),
+                 NULLIF(TRIM(b.author_id), ''),
+                 NULLIF(TRIM(MAX(p.author_id)), ''),
+                 ''
+               ) as author_id,
+               COALESCE(
+                 NULLIF(TRIM((SELECT r.author_name FROM reports r WHERE r.beneficiary_code = b.code ORDER BY r.created_at DESC LIMIT 1)), ''),
+                 NULLIF(TRIM(b.author_name), ''),
+                 NULLIF(TRIM(MAX(p.author_name)), ''),
+                 'Unassigned'
+               ) as author_name,
                b.sync_status, b.inspection_status, MAX(p.created_at) as last_updated, COUNT(p.id) as photo_count
         FROM beneficiaries b
         INNER JOIN photos p ON b.code = p.beneficiary_code
@@ -134,11 +171,11 @@ export default function DashboardScreen() {
         params.push(`%${searchQuery}%`, `%${searchQuery}%`, `%${searchQuery}%`);
       }
       if (dashDistrict) {
-        query += ` AND b.district_name = ?`;
+        query += ` AND LOWER(TRIM(b.district_name)) = LOWER(TRIM(?))`;
         params.push(dashDistrict);
       }
       if (dashCity) {
-        query += ` AND b.city_name = ?`;
+        query += ` AND LOWER(TRIM(b.city_name)) = LOWER(TRIM(?))`;
         params.push(dashCity);
       }
 
@@ -155,7 +192,7 @@ export default function DashboardScreen() {
         const rootDir = Paths.document;
         if (rootDir.exists) {
           const existingCodes = new Set(results.map(r => r.code));
-          const excludeList = ['SQLite', 'RCTAsyncLocalStorage', 'fonts', 'assets', 'projects_cache', '.expo'];
+          const excludeList = ['SQLite', 'RCTAsyncLocalStorage', 'fonts', 'assets', 'projects_cache', '.expo', 'HousingInspection'];
 
           const scanLegacyFolder = (dir: Directory): { count: number; latest: number } => {
             let count = 0;
@@ -172,14 +209,14 @@ export default function DashboardScreen() {
                   if (modTime && modTime > latest) latest = modTime;
                 }
               }
-            } catch (e) {}
+            } catch {}
             return { count, latest };
           };
 
           let items: (Directory | File)[] = [];
           try {
             items = rootDir.list();
-          } catch (e) {
+          } catch {
             items = [];
           }
           for (const item of items) {
@@ -207,7 +244,7 @@ export default function DashboardScreen() {
       }
 
       if (sortMode === 'Recently Inspected') {
-        combinedResults.sort((a, b) => new Date(b.last_updated).getTime() - new Date(a.last_updated).getTime());
+        combinedResults.sort((a, b) => parseSafeDate(b.last_updated).getTime() - parseSafeDate(a.last_updated).getTime());
       } else if (sortMode === 'Name A-Z') {
         combinedResults.sort((a, b) => a.name.localeCompare(b.name));
       } else {
@@ -221,20 +258,29 @@ export default function DashboardScreen() {
         );
       }
 
-      const groups = combinedResults.reduce((acc: any, current) => {
-        const dateObj = new Date(current.last_updated);
-        const dateStr = !isNaN(dateObj.getTime())
+      interface DateGroup {
+        title: string;
+        dateObj: Date;
+        data: BeneficiaryItem[];
+      }
+
+      const groups = combinedResults.reduce<Record<string, DateGroup>>((acc, current) => {
+        const dateObj = parseSafeDate(current.last_updated);
+        const dateStr = dateObj.getTime() > 0
           ? dateObj.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' }) 
           : 'Unknown Date';
 
-        if (!acc[dateStr]) acc[dateStr] = { title: dateStr, dateObj: dateObj, data: [] };
+        if (!acc[dateStr]) acc[dateStr] = { title: dateStr, dateObj, data: [] };
         acc[dateStr].data.push(current);
         return acc;
       }, {});
 
-      const formattedSections = Object.values(groups).sort((a: any, b: any) => b.dateObj.getTime() - a.dateObj.getTime()) as {title: string, dateObj: Date, data: BeneficiaryItem[]}[];
+      const formattedSections = Object.values(groups).sort(
+        (a, b) => b.dateObj.getTime() - a.dateObj.getTime()
+      );
       
       setRawGroupedData(formattedSections);
+      hasLoadedOnceRef.current = true;
 
       // Expand the most recent section automatically on initial load
       if (!hasAutoExpanded.current && formattedSections.length > 0) {
@@ -249,11 +295,33 @@ export default function DashboardScreen() {
     }
   }, [db, searchQuery, dashDistrict, dashCity, sortMode, isAdvancedMode, selectedAuthors]);
 
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (isSelectionMode) {
+        setSelectedCodes([]);
+        setIsSelectionMode(false);
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [isSelectionMode]);
+
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      await loadFilterOptions();
+      await loadGroupedBeneficiaries();
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [loadFilterOptions, loadGroupedBeneficiaries]);
+
   useFocusEffect(
     useCallback(() => {
       loadFilterOptions();
       loadGroupedBeneficiaries();
-    }, [loadFilterOptions, loadGroupedBeneficiaries])
+    }, [loadFilterOptions, loadGroupedBeneficiaries, seedSyncVersion])
   );
 
   const handleTitleTap = () => {
@@ -294,18 +362,129 @@ export default function DashboardScreen() {
     });
   };
 
-  const toggleSelection = (code: string) => setSelectedCodes(prev => prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code]);
+  const exitSelectionMode = () => {
+    setSelectedCodes([]);
+    setIsSelectionMode(false);
+  };
+
+  const enterSelectionMode = (code: string) => {
+    setIsSelectionMode(true);
+    setSelectedCodes(prev => (prev.includes(code) ? prev : [...prev, code]));
+  };
+
+  const toggleSelection = (code: string) => {
+    setSelectedCodes(prev => {
+      const next = prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code];
+      if (next.length === 0) {
+        setIsSelectionMode(false);
+      }
+      return next;
+    });
+  };
 
   const toggleSection = (sectionData: BeneficiaryItem[]) => {
     if (sectionData.length === 0) return;
     const sectionCodes = sectionData.map(item => item.code);
     const allSelected = sectionCodes.every(code => selectedCodes.includes(code));
-    if (allSelected) setSelectedCodes(prev => prev.filter(c => !sectionCodes.includes(c)));
-    else setSelectedCodes(prev => Array.from(new Set([...prev, ...sectionCodes])));
+    if (allSelected) {
+      const next = selectedCodes.filter(c => !sectionCodes.includes(c));
+      setSelectedCodes(next);
+      if (next.length === 0) setIsSelectionMode(false);
+    } else {
+      setIsSelectionMode(true);
+      setSelectedCodes(prev => Array.from(new Set([...prev, ...sectionCodes])));
+    }
+  };
+
+  const handleSelectAll = () => {
+    const allCodes = rawGroupedData.flatMap(g => g.data.map(item => item.code));
+    if (allCodes.length === 0) return;
+    setIsSelectionMode(true);
+    setSelectedCodes(Array.from(new Set(allCodes)));
   };
 
   const getSelectedItems = () => {
     return rawGroupedData.flatMap(g => g.data).filter(item => selectedCodes.includes(item.code));
+  };
+
+  const handleShareSelected = async () => {
+    const selectedItems = getSelectedItems();
+    if (selectedItems.length === 0) return;
+
+    setIsProcessing(true);
+    setProgressPercent(0);
+    setProgressMsg('Preparing share package...');
+    cancelRef.current.current = false;
+
+    try {
+      const zipUri = await shareProjectsZipArchive(
+        db,
+        selectedItems,
+        (msg, pct) => {
+          setProgressMsg(msg);
+          setProgressPercent(pct);
+        },
+        cancelRef.current
+      );
+      setIsProcessing(false);
+      if (zipUri) {
+        await Sharing.shareAsync(zipUri, {
+          mimeType: 'application/zip',
+          dialogTitle: 'Share Selected Projects',
+        });
+        exitSelectionMode();
+      } else if (!cancelRef.current.current) {
+        Alert.alert(
+          'Nothing to Share',
+          'The selected project(s) have no photos, notes, or reports to share.'
+        );
+      }
+    } catch (e: unknown) {
+      setIsProcessing(false);
+      const msg = e instanceof Error ? e.message : 'Failed to prepare share package.';
+      if (msg !== 'Cancelled by user') Alert.alert('Share Error', msg);
+    }
+  };
+
+  const handleDeleteSelected = () => {
+    const selectedItems = getSelectedItems();
+    if (selectedItems.length === 0) return;
+
+    Alert.alert(
+      'Delete Selected Projects',
+      `Are you sure you want to permanently delete ${selectedItems.length} selected project(s), including all their photos and notes? This action cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            setIsProcessing(true);
+            setProgressMsg('Deleting selected projects...');
+            setProgressPercent(20);
+            try {
+              for (let i = 0; i < selectedItems.length; i++) {
+                const item = selectedItems[i];
+                setProgressPercent(20 + Math.round(((i + 1) / selectedItems.length) * 80));
+                if (item.is_legacy && item.exact_path) {
+                  const dir = new Directory(item.exact_path);
+                  if (dir.exists) dir.delete();
+                } else {
+                  await deleteProjectFromDevice(db, item.code);
+                }
+              }
+              setIsProcessing(false);
+              exitSelectionMode();
+              await loadFilterOptions();
+              await loadGroupedBeneficiaries();
+            } catch {
+              setIsProcessing(false);
+              Alert.alert('Delete Failed', 'Could not delete one or more selected projects.');
+            }
+          },
+        },
+      ]
+    );
   };
 
   const handleZipTrigger = async () => {
@@ -339,32 +518,24 @@ export default function DashboardScreen() {
       setIsProcessing(false);
       
       if (zipUri) {
-        Alert.alert("ZIP Created", "Your file is ready. What would you like to do?", [
-          { text: "Save to Device", onPress: async () => {
-              try {
-                  const pickedDir = await Directory.pickDirectoryAsync();
-                  const zipFile = new File(zipUri);
-                  const destFile = pickedDir.createFile(zipFile.name || 'Export.zip', 'application/zip');
-                  const zipBytes = await zipFile.bytes();
-                  destFile.write(zipBytes);
-                  Alert.alert("Success", "ZIP saved to your selected folder.");
-                  setSelectedCodes([]);
-              } catch (e: unknown) {
-                  const msg = e instanceof Error ? e.message : '';
-                  if (msg.toLowerCase().includes('cancel')) return;
-                  Alert.alert("Save Error", "Direct saving was blocked by the OS due to memory size limits. Please use the Share option to save locally.");
-              }
-          }},
-          { text: "Share", onPress: () => {
-              Sharing.shareAsync(zipUri);
-              setSelectedCodes([]);
-          }},
-          { text: "Cancel", style: "cancel" }
-        ]);
+        try {
+          const pickedDir = await Directory.pickDirectoryAsync();
+          const zipFile = new File(zipUri);
+          const destFile = pickedDir.createFile(zipFile.name || 'Export.zip', 'application/zip');
+          const zipBytes = await zipFile.bytes();
+          destFile.write(zipBytes);
+          Alert.alert("Saved", "ZIP saved to your selected folder.");
+          exitSelectionMode();
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : '';
+          if (msg.toLowerCase().includes('cancel')) return;
+          Alert.alert("Save Error", "Direct saving was blocked by the OS due to memory size limits. Please use the Share button instead.");
+        }
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       setIsProcessing(false);
-      if (e.message !== "Cancelled by user") Alert.alert("Error", e.message);
+      const msg = e instanceof Error ? e.message : 'Export failed.';
+      if (msg !== "Cancelled by user") Alert.alert("Error", msg);
     }
   };
 
@@ -377,7 +548,7 @@ export default function DashboardScreen() {
 
     try {
       const selectedItems = getSelectedItems();
-      const groupedByCity: Record<string, any[]> = {};
+      const groupedByCity: Record<string, BeneficiaryItem[]> = {};
       
       for (const item of selectedItems) {
         const city = item.is_legacy ? 'Manual_Projects' : (item.city_name || 'Unknown_City');
@@ -385,14 +556,14 @@ export default function DashboardScreen() {
         groupedByCity[city].push(item);
       }
 
-      let pdfFilenameParts = [];
-      let allCitiesData = [];
-      let totalExpectedPhotos = selectedItems.reduce((acc, curr) => acc + curr.photo_count, 0);
+      const pdfFilenameParts: string[] = [];
+      const allCitiesData: { city: string; photos: { caption: string; base64?: string }[] }[] = [];
+      const totalExpectedPhotos = Math.max(1, selectedItems.reduce((acc, curr) => acc + curr.photo_count, 0));
       let totalPhotosGlobal = 0;
 
       for (const city of Object.keys(groupedByCity)) {
         const cityBeneficiaries = groupedByCity[city];
-        let cityPhotos = [];
+        const cityPhotos: { caption: string; base64?: string }[] = [];
         let citySerialNo = 1;
         
         for (let i = 0; i < cityBeneficiaries.length; i++) {
@@ -410,17 +581,18 @@ export default function DashboardScreen() {
               };
               photoUris = findPhotosRecursively(new Directory(b.exact_path));
           } else {
-              const photos = await db.getAllAsync<any>(`SELECT local_uri FROM photos WHERE beneficiary_code = ? ORDER BY created_at ASC`, [b.code]);
+              const photos = await db.getAllAsync<{ local_uri: string }>(`SELECT local_uri FROM photos WHERE beneficiary_code = ? ORDER BY created_at ASC`, [b.code]);
               photoUris = photos.map(p => p.local_uri);
           }
 
           for (let j = 0; j < photoUris.length; j++) {
             if (cancelRef.current.current) throw new Error("Cancelled by user");
-            const uri = photoUris[j];
+            const uri = photoUris[j].split('?')[0];
+            if (!new File(uri).exists) continue;
             
             totalPhotosGlobal++;
             setProgressPercent(Math.round((totalPhotosGlobal / totalExpectedPhotos) * 100));
-            setProgressMsg(`Formatting image ${totalPhotosGlobal} of${totalExpectedPhotos}...`);
+            setProgressMsg(`Formatting image ${totalPhotosGlobal} of ${totalExpectedPhotos}...`);
             
             const manipResult = await ImageManipulator.manipulateAsync(
               uri, [{ resize: { width: 800 } }], { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
@@ -505,16 +677,17 @@ export default function DashboardScreen() {
              try {
                 const cUri = customPdfFile.contentUri;
                 await IntentLauncher.startActivityAsync('android.intent.action.VIEW', { data: cUri, flags: 1, type: 'application/pdf' });
-             } catch (e) { Alert.alert("Error", "No PDF Viewer installed on this device."); }
+             } catch { Alert.alert("Error", "No PDF Viewer installed on this device."); }
           }},
           { text: "Share", onPress: () => Sharing.shareAsync(customUri) },
           { text: "Cancel", style: "cancel" }
       ]);
-      setSelectedCodes([]); 
+      exitSelectionMode();
 
-    } catch (error: any) {
+    } catch (error: unknown) {
       setIsProcessing(false);
-      if (error.message !== "Cancelled by user") Alert.alert("Failed", "Could not generate PDF document.");
+      const msg = error instanceof Error ? error.message : 'Could not generate PDF document.';
+      if (msg !== "Cancelled by user") Alert.alert("Failed", msg);
     }
   };
 
@@ -551,7 +724,7 @@ export default function DashboardScreen() {
       (uniqueAuthors.length > 0 && selectedAuthors.length === uniqueAuthors.length);
 
     return (
-      <Modal visible={activeDropdown !== null} transparent animationType="fade">
+      <Modal visible={activeDropdown !== null} transparent animationType="fade" onRequestClose={() => setActiveDropdown(null)}>
         <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setActiveDropdown(null)}>
           <TouchableWithoutFeedback>
             <View style={styles.dropdownCard}>
@@ -643,7 +816,7 @@ export default function DashboardScreen() {
         <View style={styles.headerTop}>
           <TouchableWithoutFeedback onPress={handleTitleTap}>
             <View style={{flexDirection: 'row', alignItems: 'center'}}>
-              <Text style={styles.title}>Export Workspace</Text>
+              <Text style={styles.title}>Workspace</Text>
               {isAdvancedMode && <View style={styles.advancedBadge}><Text style={styles.advancedBadgeText}>ADVANCED</Text></View>}
             </View>
           </TouchableWithoutFeedback>
@@ -701,6 +874,21 @@ export default function DashboardScreen() {
         </View>
       </View>
 
+      {isSelectionMode && (
+        <View style={styles.selectionBar}>
+          <Text style={styles.selectionBarCount}>{selectedCodes.length} Selected</Text>
+          <View style={styles.selectionBarActions}>
+            <TouchableOpacity style={styles.selectionActionBtn} onPress={handleSelectAll}>
+              <Text style={styles.selectionActionText}>Select All</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.selectionCancelBtn} onPress={exitSelectionMode}>
+              <Ionicons name="close" size={16} color="#EF4444" />
+              <Text style={styles.selectionCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
       {isLoading ? (
         <ActivityIndicator size="large" color="#2563EB" style={{ marginTop: 50 }} />
       ) : (
@@ -708,7 +896,10 @@ export default function DashboardScreen() {
           sections={renderedSections}
           keyExtractor={(item) => item.code}
           stickySectionHeadersEnabled={true}
-          contentContainerStyle={{ paddingBottom: 120, paddingTop: 10 }} 
+          contentContainerStyle={{ flexGrow: 1, paddingBottom: 120, paddingTop: 10 }}
+          refreshControl={
+            <RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} colors={['#2563EB']} tintColor="#2563EB" />
+          } 
           renderSectionHeader={({ section: { title, originalData } }) => {
             const isAllSelected = originalData.length > 0 && originalData.every(item => selectedCodes.includes(item.code));
             const isExpanded = expandedDates.has(title);
@@ -716,9 +907,11 @@ export default function DashboardScreen() {
             return (
               <View style={styles.sectionHeader}>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <TouchableOpacity style={[styles.checkbox, isAllSelected && styles.checkboxSelected, { width: 22, height: 22, marginRight: 10 }]} onPress={() => toggleSection(originalData)}>
-                    {isAllSelected && <Ionicons name="checkmark" size={14} color="#FFF" />}
-                  </TouchableOpacity>
+                  {isSelectionMode && (
+                    <TouchableOpacity style={[styles.checkbox, isAllSelected && styles.checkboxSelected, { width: 22, height: 22, marginRight: 10 }]} onPress={() => toggleSection(originalData)}>
+                      {isAllSelected && <Ionicons name="checkmark" size={14} color="#FFF" />}
+                    </TouchableOpacity>
+                  )}
                   <Text style={styles.sectionHeaderText}>{title}</Text>
                 </View>
                 <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', padding: 5 }} onPress={() => toggleSectionExpansion(title)}>
@@ -730,28 +923,47 @@ export default function DashboardScreen() {
           }}
           renderItem={({ item }) => {
             const isSelected = selectedCodes.includes(item.code);
+            const isMine = !item.is_legacy && isOwnedByCurrentUser(
+              { authorId: item.author_id, authorName: item.author_name },
+              ownershipCtx
+            );
+            const isImported = !item.is_legacy && !isMine;
+
             return (
-              <View style={[styles.itemCard, styles.cardWithPhotos, isSelected && styles.itemCardSelected, item.is_legacy && styles.legacyItemCard]}>
-                <TouchableOpacity style={[styles.checkbox, isSelected && styles.checkboxSelected]} onPress={() => toggleSelection(item.code)} hitSlop={{top: 15, bottom: 15, left: 10, right: 15}}>
-                  {isSelected && <Ionicons name="checkmark" size={16} color="#FFF" />}
-                </TouchableOpacity>
+              <View
+                style={[
+                  styles.itemCard,
+                  isMine && styles.cardWithPhotos,
+                  isImported && styles.importedItemCard,
+                  item.is_legacy && styles.legacyItemCard,
+                  isSelected && styles.itemCardSelected,
+                ]}
+              >
+                {isSelectionMode && (
+                  <TouchableOpacity style={[styles.checkbox, isSelected && styles.checkboxSelected]} onPress={() => toggleSelection(item.code)} hitSlop={{top: 15, bottom: 15, left: 10, right: 15}}>
+                    {isSelected && <Ionicons name="checkmark" size={16} color="#FFF" />}
+                  </TouchableOpacity>
+                )}
                 
-                <TouchableOpacity style={{ flex: 1 }} onPress={() => { 
-                    if (selectedCodes.length > 0) toggleSelection(item.code); 
+                <TouchableOpacity
+                  style={{ flex: 1 }}
+                  onPress={() => { 
+                    if (isSelectionMode) toggleSelection(item.code); 
                     else if (!item.is_legacy) router.push(`/beneficiary/${encodeURIComponent(item.code)}`); 
                   }} 
-                  onLongPress={() => toggleSelection(item.code)}>
+                  onLongPress={() => enterSelectionMode(item.code)}
+                >
                   <View style={styles.cardHeaderInfo}>
                     {item.is_legacy && <Ionicons name="folder-open" size={18} color="#F59E0B" style={{marginRight: 6}} />}
-                    <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
+                    <Text style={styles.itemTitle} numberOfLines={2}>{toTitleCase(item.name)}</Text>
                   </View>
                   <View style={styles.cardSubRow}>
                     <Text style={styles.itemCode}>ID: {item.original_code || item.code}</Text>
                     
                     <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                      <View style={[styles.photoCountBadge, item.is_legacy && {backgroundColor: '#FEF3C7'}]}>
-                        <Text style={[styles.photoCountText, item.is_legacy && {color: '#B45309'}]}>{item.photo_count}</Text>
-                        <Ionicons name="images" size={12} color={item.is_legacy ? "#D97706" : "#10B981"} style={{ marginLeft: 4 }} />
+                      <View style={[styles.photoCountBadge, (item.is_legacy || isImported) && {backgroundColor: '#FEF3C7'}]}>
+                        <Text style={[styles.photoCountText, (item.is_legacy || isImported) && {color: '#B45309'}]}>{item.photo_count}</Text>
+                        <Ionicons name="images" size={12} color={(item.is_legacy || isImported) ? "#D97706" : "#10B981"} style={{ marginLeft: 4 }} />
                       </View>
                       {item.sync_status === 'pending' || item.is_legacy ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
                     </View>
@@ -759,10 +971,9 @@ export default function DashboardScreen() {
                   <View style={styles.cardFooter}>
                     <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {item.is_legacy ? 'Device Directory' : (toTitleCase(item.city_name) || 'N/A')}</Text>
                     {!item.is_legacy && (
-                      <View style={styles.authorBadge}>
-                        <Ionicons name="person-outline" size={11} color="#475569" style={{ marginRight: 4 }} />
-                        <Text style={styles.authorBadgeText} numberOfLines={1}>
-                          {item.author_name || 'Unassigned'}
+                      <View style={[styles.authorBadge, isMine ? styles.authorBadgeYou : styles.authorBadgeImported]}>
+                        <Text style={[styles.authorBadgeText, isMine ? styles.authorBadgeTextYou : styles.authorBadgeTextImported]}>
+                          {isMine ? 'You' : 'Imported'}
                         </Text>
                       </View>
                     )}
@@ -782,26 +993,28 @@ export default function DashboardScreen() {
 
       {selectedCodes.length > 0 && (
         <View style={styles.bottomToolbar}>
-          <Text style={styles.selectedCountText}>{selectedCodes.length} Selected</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.toolbarActions}>
-            <TouchableOpacity onPress={() => setSelectedCodes([])} style={{marginRight: 10}}>
-              <Ionicons name="close-circle" size={36} color="#EF4444" />
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#2563EB'}]} onPress={() => setShowPdfSettings(true)}>
-              <Ionicons name="document-text" size={18} color="#FFF" style={{ marginRight: 6 }} />
-              <Text style={styles.exportBtnText}>PDF</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#10B981'}]} onPress={handleZipTrigger}>
-              <Ionicons name="archive" size={18} color="#FFF" style={{ marginRight: 6 }} />
-              <Text style={styles.exportBtnText}>ZIP</Text>
-            </TouchableOpacity>
-          </ScrollView>
+          <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#10B981'}]} onPress={handleZipTrigger}>
+            <Ionicons name="save-outline" size={17} color="#FFF" style={{ marginRight: 5 }} />
+            <Text style={styles.exportBtnText}>Save</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#0EA5E9'}]} onPress={handleShareSelected}>
+            <Ionicons name="share-social" size={17} color="#FFF" style={{ marginRight: 5 }} />
+            <Text style={styles.exportBtnText}>Share</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#2563EB'}]} onPress={() => setShowPdfSettings(true)}>
+            <Ionicons name="document-text" size={17} color="#FFF" style={{ marginRight: 5 }} />
+            <Text style={styles.exportBtnText}>PDF</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.exportBtn, {backgroundColor: '#EF4444'}]} onPress={handleDeleteSelected}>
+            <Ionicons name="trash" size={17} color="#FFF" style={{ marginRight: 5 }} />
+            <Text style={styles.exportBtnText}>Delete</Text>
+          </TouchableOpacity>
         </View>
       )}
 
       {renderDropdownModal()}
 
-      <Modal visible={showCityPrompt} transparent animationType="slide">
+      <Modal visible={showCityPrompt} transparent animationType="slide" onRequestClose={() => setShowCityPrompt(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Missing City Names</Text>
@@ -815,7 +1028,7 @@ export default function DashboardScreen() {
         </View>
       </Modal>
 
-      <Modal visible={isProcessing} transparent animationType="fade">
+      <Modal visible={isProcessing} transparent animationType="fade" onRequestClose={() => { cancelRef.current.current = true; setIsProcessing(false); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
             <ActivityIndicator size="large" color="#2563EB" style={{ marginBottom: 15 }} />
@@ -827,7 +1040,7 @@ export default function DashboardScreen() {
         </View>
       </Modal>
 
-      <Modal visible={showPinModal} transparent animationType="fade">
+      <Modal visible={showPinModal} transparent animationType="fade" onRequestClose={() => { setShowPinModal(false); setTapCount(0); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Admin Access</Text>
@@ -840,7 +1053,7 @@ export default function DashboardScreen() {
         </View>
       </Modal>
 
-      <Modal visible={showPdfSettings} transparent animationType="slide">
+      <Modal visible={showPdfSettings} transparent animationType="slide" onRequestClose={() => setShowPdfSettings(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>PDF Export Settings</Text>
@@ -892,8 +1105,41 @@ const styles = StyleSheet.create({
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#F1F5F9', paddingHorizontal: 15, paddingVertical: 10, borderTopWidth: 1, borderBottomWidth: 1, borderColor: '#E2E8F0' },
   sectionHeaderText: { fontSize: 14, fontWeight: 'bold', color: '#334155' },
   sectionCountText: { fontSize: 13, color: '#64748B', fontWeight: '600' },
+  selectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderColor: '#BFDBFE',
+  },
+  selectionBarCount: { fontSize: 13, fontWeight: '800', color: '#1E3A8A' },
+  selectionBarActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  selectionActionBtn: {
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+  },
+  selectionActionText: { fontSize: 12, fontWeight: '700', color: '#2563EB' },
+  selectionCancelBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF2F2',
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+  selectionCancelText: { fontSize: 12, fontWeight: '700', color: '#EF4444', marginLeft: 3 },
   itemCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 15, marginHorizontal: 15, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0' },
   cardWithPhotos: { borderColor: '#10B981', backgroundColor: '#F0FDF4' },
+  importedItemCard: { borderColor: '#EAB308', backgroundColor: '#FEFCE8' },
   itemCardSelected: { borderColor: '#2563EB', backgroundColor: '#EFF6FF', borderWidth: 2 },
   legacyItemCard: { borderColor: '#F59E0B', backgroundColor: '#FFFBEB' },
   checkbox: { width: 24, height: 24, borderRadius: 6, borderWidth: 2, borderColor: '#CBD5E1', marginRight: 15, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFF' },
@@ -908,11 +1154,9 @@ const styles = StyleSheet.create({
   cardDetail: { fontSize: 13, color: '#475569' },
   emptyState: { alignItems: 'center', marginTop: 60 },
   emptyStateText: { marginTop: 10, color: '#94A3B8', fontSize: 16 },
-  bottomToolbar: { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#FFF', borderTopWidth: 1, borderColor: '#E2E8F0', padding: 15, flexDirection: 'row', alignItems: 'center', elevation: 15 },
-  selectedCountText: { fontSize: 16, fontWeight: 'bold', color: '#1E293B', marginRight: 15 },
-  toolbarActions: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  exportBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10 },
-  exportBtnText: { color: '#FFF', fontWeight: 'bold', fontSize: 14 },
+  bottomToolbar: { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#FFF', borderTopWidth: 1, borderColor: '#E2E8F0', paddingHorizontal: 12, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, elevation: 15 },
+  exportBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 11, paddingHorizontal: 8, borderRadius: 10 },
+  exportBtnText: { color: '#FFF', fontWeight: 'bold', fontSize: 13 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20 },
   progressCard: { backgroundColor: '#FFF', padding: 30, borderRadius: 16, width: '85%', alignItems: 'center' },
   progressBarBg: { width: '100%', height: 12, backgroundColor: '#E2E8F0', borderRadius: 6, overflow: 'hidden', marginBottom: 10 },
@@ -947,6 +1191,10 @@ const styles = StyleSheet.create({
   authorOptionRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 18, borderBottomWidth: 1, borderColor: '#F1F5F9' },
   authorCheckbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: '#CBD5E1', marginRight: 12, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFF' },
   authorOptionText: { fontSize: 15, color: '#334155', fontWeight: '600', flex: 1 },
-  authorBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F1F5F9', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, maxWidth: '55%', borderWidth: 1, borderColor: '#E2E8F0' },
-  authorBadgeText: { fontSize: 11, color: '#475569', fontWeight: '600' }
+  authorBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, borderWidth: 1 },
+  authorBadgeYou: { backgroundColor: '#DCFCE7', borderColor: '#86EFAC' },
+  authorBadgeImported: { backgroundColor: '#FEF3C7', borderColor: '#FDE047' },
+  authorBadgeText: { fontSize: 11, fontWeight: '800' },
+  authorBadgeTextYou: { color: '#166534' },
+  authorBadgeTextImported: { color: '#92400E' }
 });

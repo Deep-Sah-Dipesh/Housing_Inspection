@@ -46,6 +46,8 @@ google-services.json
 
 #credentials
 credentials.json
+/credentials
+.env
 
 #dataset files
 *.xlsx
@@ -53,5 +55,4 @@ credentials.json
 *.csv
 *.db
 *.sqlite
-assets/beneficiaries_seed*.json
 databases_and_scripts/processed/

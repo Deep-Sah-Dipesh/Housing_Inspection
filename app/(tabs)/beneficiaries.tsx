@@ -1,10 +1,11 @@
-import React, { useState, useCallback, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Modal, ScrollView, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Modal, ScrollView, Alert, ActivityIndicator, RefreshControl } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppStore } from '../../store/appStore';
+import { deriveAuthorId, isOwnedByCurrentUser, resolveAuthorName } from '../../utils/authorHelpers';
 
 interface Beneficiary {
   code: string;
@@ -15,7 +16,12 @@ interface Beneficiary {
   inspection_status: string;
   sync_status: string;
   photo_count: number;
+  report_count: number;
   is_custom?: number;
+  author_id?: string | null;
+  author_name?: string | null;
+  latest_report_author_id?: string | null;
+  latest_report_author_name?: string | null;
 }
 
 const SORT_OPTIONS = ['Name A-Z', 'Name Z-A', 'Inspection Pending', 'Recently Inspected', 'Recently Added'] as const;
@@ -32,7 +38,7 @@ const getShortSortName = (sort: SortMode) => {
 
 const toTitleCase = (str?: string | null) => {
   if (!str) return 'N/A';
-  let cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  const cleanStr = str.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
   return cleanStr.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase());
 };
 
@@ -45,11 +51,30 @@ export default function BeneficiariesScreen() {
   const db = useSQLiteContext();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { district, city, setFilters, clearFilters } = useAppStore();
+  const {
+    userId,
+    authorId,
+    userName,
+    officialName,
+    district,
+    city,
+    setFilters,
+    clearFilters,
+    seedSyncVersion,
+  } = useAppStore();
+
+  const ownershipCtx = {
+    currentAuthorId: authorId,
+    currentUserId: userId,
+    currentOfficialName: officialName,
+    currentUserName: userName,
+  };
 
   const [data, setData] = useState<Beneficiary[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
 
   const [sortMode, setSortMode] = useState<SortMode>('Name A-Z');
   const [pageLimit, setPageLimit] = useState(100);
@@ -87,7 +112,7 @@ export default function BeneficiariesScreen() {
         if (!cancelled) {
           setAddAvailableCities(rows.map(r => r.city_name));
         }
-      } catch (e) {
+      } catch {
         if (!cancelled) setAddAvailableCities([]);
       }
     })();
@@ -111,51 +136,74 @@ export default function BeneficiariesScreen() {
       setUniqueDistricts(dists.map(d => d.district_name));
       let cityQuery = `SELECT DISTINCT city_name FROM beneficiaries WHERE city_name IS NOT NULL AND TRIM(city_name) != ''`;
       const cityParams: string[] = [];
-      if (district) { cityQuery += ` AND district_name = ?`; cityParams.push(district); }
+      if (district) { cityQuery += ` AND LOWER(TRIM(district_name)) = LOWER(TRIM(?))`; cityParams.push(district); }
       cityQuery += ` ORDER BY city_name ASC`;
       const cits = await db.getAllAsync<{city_name: string}>(cityQuery, cityParams);
       setUniqueCities(cits.map(c => c.city_name));
-    } catch (error) {}
+    } catch {}
   }, [db, district]);
 
   const loadBeneficiaries = useCallback(async () => {
-    setIsLoading(true);
+    if (!hasLoadedOnceRef.current) {
+      setIsLoading(true);
+    }
     try {
       let query = `
-        SELECT b.code, b.name, b.district_name, b.city_name, b.project_name, b.inspection_status, b.sync_status, COALESCE(b.is_custom, 0) as is_custom,
-        (SELECT COUNT(id) FROM photos WHERE beneficiary_code = b.code) as photo_count
+        SELECT b.code, b.name, b.district_name, b.city_name, b.project_name, b.inspection_status, b.sync_status,
+               COALESCE(b.is_custom, 0) as is_custom,
+               b.author_id, b.author_name,
+               (SELECT COUNT(id) FROM photos WHERE beneficiary_code = b.code) as photo_count,
+               (SELECT COUNT(id) FROM reports WHERE beneficiary_code = b.code) as report_count,
+               (SELECT author_id FROM reports WHERE beneficiary_code = b.code ORDER BY created_at DESC LIMIT 1) as latest_report_author_id,
+               (SELECT author_name FROM reports WHERE beneficiary_code = b.code ORDER BY created_at DESC LIMIT 1) as latest_report_author_name
         FROM beneficiaries b WHERE 1=1
       `;
       const params: (string | number)[] = [];
-      if (searchQuery) { query += ` AND (b.name LIKE ? OR b.code LIKE ?)`; params.push(`%${searchQuery}%`, `%${searchQuery}%`); }
-      if (district) { query += ` AND b.district_name = ?`; params.push(district); }
-      if (city) { query += ` AND b.city_name = ?`; params.push(city); }
+      if (searchQuery) {
+        query += ` AND (b.name LIKE ? OR b.code LIKE ? OR b.city_name LIKE ? OR b.district_name LIKE ?)`;
+        params.push(`%${searchQuery}%`, `%${searchQuery}%`, `%${searchQuery}%`, `%${searchQuery}%`);
+      }
+      if (district) { query += ` AND LOWER(TRIM(b.district_name)) = LOWER(TRIM(?))`; params.push(district); }
+      if (city) { query += ` AND LOWER(TRIM(b.city_name)) = LOWER(TRIM(?))`; params.push(city); }
 
       if (sortMode === 'Name A-Z') query += ` ORDER BY b.name ASC`;
       else if (sortMode === 'Name Z-A') query += ` ORDER BY b.name DESC`;
       else if (sortMode === 'Inspection Pending') query += ` ORDER BY CASE WHEN b.inspection_status = 'pending' THEN 0 ELSE 1 END, b.last_updated DESC`;
       else if (sortMode === 'Recently Added') query += ` ORDER BY COALESCE(b.is_custom, 0) DESC, b.last_updated DESC, b.rowid DESC`;
-      else query += ` ORDER BY CASE WHEN photo_count > 0 THEN 0 ELSE 1 END, b.last_updated DESC`;
+      else query += ` ORDER BY CASE WHEN (photo_count > 0 OR report_count > 0) THEN 0 ELSE 1 END, b.last_updated DESC`;
       
       query += ` LIMIT ?`;
       params.push(pageLimit);
       const results = await db.getAllAsync<Beneficiary>(query, params);
       setData(results);
-    } catch (error) {} finally { setIsLoading(false); }
+      hasLoadedOnceRef.current = true;
+    } catch (error) {
+      console.error('Failed to load beneficiaries:', error);
+    } finally { setIsLoading(false); }
   }, [db, searchQuery, district, city, sortMode, pageLimit]);
+
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      await loadFilterOptions();
+      await loadBeneficiaries();
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [loadFilterOptions, loadBeneficiaries]);
 
   useFocusEffect(
     useCallback(() => {
       loadFilterOptions();
       loadBeneficiaries();
-    }, [loadFilterOptions, loadBeneficiaries])
+    }, [loadFilterOptions, loadBeneficiaries, seedSyncVersion])
   );
 
   const handleAddProject = async () => {
-    const cleanCode = newProject.code.trim();
+    const cleanCode = newProject.code.toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
     const cleanName = newProject.name.trim();
     if (!cleanCode || !cleanName) {
-      return Alert.alert("Missing Fields", "Application Number and Beneficiary Name are required.");
+      return Alert.alert("Missing Fields", "Code and Beneficiary Name are required.");
     }
 
     const cleanSerial = newProject.serial_number.trim();
@@ -165,15 +213,25 @@ export default function BeneficiariesScreen() {
     const cleanProjectName = newProject.project_name.trim();
     const cleanSiteAddress = newProject.site_address.trim();
 
+    const effectiveAuthorId = authorId || deriveAuthorId(userId) || null;
+    const effectiveAuthorName = resolveAuthorName(officialName, userName);
+
     try {
       const existing = await db.getFirstAsync<{ code: string }>(`SELECT code FROM beneficiaries WHERE code = ?`, [cleanCode]);
       if (existing) {
-        return Alert.alert("Duplicate Project", "A project with this Application Number already exists.");
+        return Alert.alert("Duplicate Project", "A project with this Code already exists.");
       }
 
       await db.runAsync(
-        `INSERT INTO beneficiaries (code, name, serial_number, father_name, district_name, city_name, project_name, site_address, inspection_status, sync_status, is_custom, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 1, CURRENT_TIMESTAMP)`,
-        [cleanCode, cleanName, cleanSerial, cleanFather, cleanDistrict, cleanCity, cleanProjectName, cleanSiteAddress]
+        `INSERT INTO beneficiaries (
+          code, name, serial_number, father_name, district_name, city_name,
+          project_name, site_address, inspection_status, sync_status, is_custom,
+          author_id, author_name, last_updated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 1, ?, ?, CURRENT_TIMESTAMP)`,
+        [
+          cleanCode, cleanName, cleanSerial, cleanFather, cleanDistrict, cleanCity,
+          cleanProjectName, cleanSiteAddress, effectiveAuthorId, effectiveAuthorName,
+        ]
       );
 
       // Clear active filters if they would hide the newly added custom project
@@ -186,13 +244,13 @@ export default function BeneficiariesScreen() {
       resetAddModal();
       await loadFilterOptions();
       await loadBeneficiaries();
-    } catch (error: unknown) {
+    } catch {
       Alert.alert("Database Error", "Could not save project. Please try again.");
     }
   };
 
   const renderDropdownModal = () => (
-    <Modal visible={activeDropdown !== null} transparent animationType="fade">
+    <Modal visible={activeDropdown !== null} transparent animationType="fade" onRequestClose={() => setActiveDropdown(null)}>
       <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setActiveDropdown(null)}>
         <View style={styles.dropdownCard}>
           <Text style={styles.dropdownTitle}>{activeDropdown === 'district' ? 'Select District' : activeDropdown === 'city' ? 'Select City' : 'Sort By'}</Text>
@@ -229,10 +287,10 @@ export default function BeneficiariesScreen() {
     <View style={styles.container}>
       <View style={[styles.header, { paddingTop: insets.top + 10 }]}>
         <View style={styles.headerTop}>
-          <Text style={styles.title}>Projects</Text>
+          <Text style={styles.title}>All Projects</Text>
           <TouchableOpacity style={styles.addBtn} onPress={() => setAddModalVisible(true)}>
             <Ionicons name="add" size={20} color="#FFF" />
-            <Text style={styles.addBtnText}>New</Text>
+            <Text style={styles.addBtnText}>Add</Text>
           </TouchableOpacity>
         </View>
 
@@ -286,7 +344,10 @@ export default function BeneficiariesScreen() {
         <FlatList
           data={data}
           keyExtractor={(item) => item.code}
-          contentContainerStyle={{ padding: 15, paddingBottom: 100 }}
+          contentContainerStyle={{ flexGrow: 1, padding: 15, paddingBottom: 100 }}
+          refreshControl={
+            <RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} colors={['#2563EB']} tintColor="#2563EB" />
+          }
           onEndReached={() => {
             if (!isLoading && data.length >= pageLimit) {
               setPageLimit(prev => prev + 100);
@@ -294,36 +355,64 @@ export default function BeneficiariesScreen() {
           }}
           onEndReachedThreshold={0.4}
           renderItem={({ item }) => {
-            const hasPhotos = item.photo_count > 0;
+            const hasInspection = item.photo_count > 0 || item.report_count > 0;
+            const isOwnedByYou = isOwnedByCurrentUser(
+              {
+                authorId: item.latest_report_author_id ?? item.author_id,
+                authorName: item.latest_report_author_name ?? item.author_name,
+              },
+              ownershipCtx
+            );
+            const isLocalInspected = hasInspection && isOwnedByYou;
+            const isImportedInspected = hasInspection && !isOwnedByYou;
+
             const locationLabel = [item.city_name, item.district_name]
               .filter((v): v is string => Boolean(v && v.trim()))
               .map(toTitleCase)
               .join(', ') || 'No location specified';
+
             return (
-              <TouchableOpacity style={[styles.card, hasPhotos && styles.cardWithPhotos]} onPress={() => router.push(`/beneficiary/${encodeURIComponent(item.code)}`)}>
+              <TouchableOpacity
+                style={[
+                  styles.card,
+                  isLocalInspected && styles.cardLocalOwned,
+                  isImportedInspected && styles.cardImported,
+                ]}
+                onPress={() => router.push(`/beneficiary/${encodeURIComponent(item.code)}`)}
+              >
                 <View style={styles.cardHeaderInfo}>
-                  <Text style={styles.itemTitle}>{toTitleCase(item.name)}</Text>
+                  <Text style={styles.itemTitle} numberOfLines={2}>{toTitleCase(item.name)}</Text>
                   {item.is_custom === 1 && (
                     <View style={styles.customBadge}>
                       <Text style={styles.customBadgeText}>Custom</Text>
                     </View>
                   )}
                 </View>
+
                 <View style={styles.cardSubRow}>
                   <Text style={styles.itemCode}>ID: {item.code}</Text>
                   
                   <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                    {hasPhotos && (
-                      <View style={styles.photoCountBadge}>
-                        <Text style={styles.photoCountText}>{item.photo_count}</Text>
-                        <Ionicons name="images" size={12} color="#10B981" style={{ marginLeft: 4 }} />
+                    {item.photo_count > 0 && (
+                      <View style={[styles.photoCountBadge, isImportedInspected && styles.photoCountBadgeImported]}>
+                        <Text style={[styles.photoCountText, isImportedInspected && styles.photoCountTextImported]}>{item.photo_count}</Text>
+                        <Ionicons name="images" size={12} color={isImportedInspected ? '#B45309' : '#10B981'} style={{ marginLeft: 4 }} />
                       </View>
                     )}
                     {item.sync_status === 'pending' ? <Ionicons name="cloud-offline" size={18} color="#D97706" style={{ marginLeft: 8 }} /> : <Ionicons name="cloud-done" size={18} color="#059669" style={{ marginLeft: 8 }} />}
                   </View>
                 </View>
                 <View style={styles.cardFooter}>
-                  <Text style={styles.cardDetail}><Ionicons name="location" size={14} color="#64748B" /> {locationLabel}</Text>
+                  <Text style={[styles.cardDetail, { flex: 1, marginRight: 8 }]} numberOfLines={1}>
+                    <Ionicons name="location" size={14} color="#64748B" /> {locationLabel}
+                  </Text>
+                  {hasInspection && (
+                    <View style={[styles.ownerBadge, isLocalInspected ? styles.ownerBadgeYou : styles.ownerBadgeImported]}>
+                      <Text style={[styles.ownerBadgeText, isLocalInspected ? styles.ownerBadgeTextYou : styles.ownerBadgeTextImported]}>
+                        {isLocalInspected ? 'You' : 'Imported'}
+                      </Text>
+                    </View>
+                  )}
                 </View>
               </TouchableOpacity>
             );
@@ -345,10 +434,27 @@ export default function BeneficiariesScreen() {
           <TouchableOpacity onPress={() => { setAddModalVisible(false); resetAddModal(); }}><Ionicons name="close" size={28} color="#1E293B" /></TouchableOpacity>
         </View>
         <ScrollView contentContainerStyle={styles.formContainer} keyboardShouldPersistTaps="handled">
-          <Text style={styles.inputLabel}>Application Number (Code) *</Text>
-          <TextInput style={styles.input} placeholder="Enter application number" placeholderTextColor="#94A3B8" value={newProject.code} onChangeText={(text) => setNewProject({...newProject, code: text})} />
+          <Text style={styles.inputLabel}>Code *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="e.g. GJ034380125146007239"
+            placeholderTextColor="#94A3B8"
+            autoCapitalize="characters"
+            autoCorrect={false}
+            value={newProject.code}
+            onChangeText={(text) =>
+              setNewProject({ ...newProject, code: text.toUpperCase().replace(/[^A-Z0-9]/g, '') })
+            }
+          />
           <Text style={styles.inputLabel}>Beneficiary Name *</Text>
-          <TextInput style={styles.input} placeholder="Enter beneficiary name" placeholderTextColor="#94A3B8" value={newProject.name} onChangeText={(text) => setNewProject({...newProject, name: text})} />
+          <TextInput
+            style={styles.input}
+            placeholder="Enter beneficiary name"
+            placeholderTextColor="#94A3B8"
+            autoCapitalize="sentences"
+            value={newProject.name}
+            onChangeText={(text) => setNewProject({ ...newProject, name: text })}
+          />
           <Text style={styles.inputLabel}>Serial Number</Text>
           <TextInput style={styles.input} placeholder="Optional" placeholderTextColor="#94A3B8" value={newProject.serial_number} onChangeText={(text) => setNewProject({...newProject, serial_number: text})} keyboardType="numeric" />
           <Text style={styles.inputLabel}>Father Name</Text>
@@ -513,7 +619,7 @@ const styles = StyleSheet.create({
   header: { backgroundColor: '#FFF', paddingHorizontal: 20, paddingBottom: 15, borderBottomWidth: 1, borderColor: '#E2E8F0' },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
   title: { fontSize: 26, fontWeight: '800', color: '#1E293B' },
-  addBtn: { flexDirection: 'row', backgroundColor: '#2563EB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
+  addBtn: { flexDirection: 'row', backgroundColor: '#2563EB', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
   addBtnText: { color: '#FFF', fontWeight: 'bold', marginLeft: 4 },
   searchContainer: { flexDirection: 'row', alignItems: 'center', width: '100%', height: 46, backgroundColor: '#F1F5F9', borderRadius: 10, paddingHorizontal: 14, marginBottom: 10 },
   searchInput: { flex: 1, minWidth: 0, height: '100%', marginLeft: 10, marginRight: 6, fontSize: 15, color: '#1E293B', paddingVertical: 0 },
@@ -527,13 +633,22 @@ const styles = StyleSheet.create({
   fixedClearBtn: { padding: 2, backgroundColor: '#FFF', borderRadius: 16 },
   
   card: { backgroundColor: '#FFF', padding: 16, borderRadius: 12, marginBottom: 12, borderWidth: 1, borderColor: '#E2E8F0', elevation: 2 },
-  cardWithPhotos: { borderColor: '#10B981', backgroundColor: '#F0FDF4' },
+  cardLocalOwned: { borderColor: '#10B981', backgroundColor: '#F0FDF4' },
+  cardImported: { borderColor: '#EAB308', backgroundColor: '#FEFCE8' },
   cardHeaderInfo: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
   itemTitle: { fontSize: 17, fontWeight: '700', color: '#1E293B', flex: 1, marginRight: 10 },
-  cardSubRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 },
+  ownerBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, borderWidth: 1 },
+  ownerBadgeYou: { backgroundColor: '#DCFCE7', borderColor: '#86EFAC' },
+  ownerBadgeImported: { backgroundColor: '#FEF3C7', borderColor: '#FDE047' },
+  ownerBadgeText: { fontSize: 11, fontWeight: '800' },
+  ownerBadgeTextYou: { color: '#166534' },
+  ownerBadgeTextImported: { color: '#92400E' },
+  cardSubRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 },
   itemCode: { fontSize: 13, color: '#64748B', fontWeight: '500' },
   photoCountBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#D1FAE5', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 },
+  photoCountBadgeImported: { backgroundColor: '#FEF3C7' },
   photoCountText: { fontSize: 12, fontWeight: 'bold', color: '#065F46' },
+  photoCountTextImported: { color: '#92400E' },
   cardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 },
   cardDetail: { fontSize: 13, color: '#475569' },
   emptyState: { alignItems: 'center', marginTop: 80 },
